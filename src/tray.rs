@@ -1,0 +1,85 @@
+// batterybar-modern — 系统托盘图标（NOTIFYICONDATAW）
+#![allow(non_snake_case)]
+
+use windows::Win32::Foundation::HWND;
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::{
+    ExtractIconW, Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW,
+};
+use windows::Win32::UI::WindowsAndMessaging::{LoadIconW, IDI_APPLICATION};
+use windows_core::{w, PCWSTR};
+
+pub const TRAY_CALLBACK: u32 = 0xB00B; // 自定义回调消息
+const TRAY_ID: u32 = 1;
+
+pub struct TrayIcon {
+    pub hwnd: HWND,
+}
+
+impl TrayIcon {
+    /// shell32 电池图标（索引 41，Win10/11 实测），失败回落应用默认图标。
+    pub fn new(hwnd: HWND) -> windows_core::Result<Self> {
+        let mut nid = NOTIFYICONDATAW::default();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = TRAY_ID;
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        nid.uCallbackMessage = TRAY_CALLBACK;
+
+        unsafe {
+            let hinstance = GetModuleHandleW(PCWSTR::null())?;
+            let shell = match windows::Win32::System::LibraryLoader::LoadLibraryW(w!("shell32.dll")) {
+                Ok(h) => h,
+                Err(_) => Default::default(),
+            };
+            let hicon = if !shell.is_invalid() {
+                ExtractIconW(Some(hinstance.into()), w!("shell32.dll"), 41)
+            } else {
+                Default::default()
+            };
+            nid.hIcon = if hicon.is_invalid() {
+                LoadIconW(Some(hinstance.into()), IDI_APPLICATION).unwrap_or_default()
+            } else {
+                hicon
+            };
+            if !shell.is_invalid() {
+                let _ = windows::Win32::Foundation::FreeLibrary(shell);
+            }
+            // tooltip（含 NUL 结尾，上限 128）
+            let tip: Vec<u16> = "BatteryBar Modern\0".encode_utf16().collect();
+            for (i, c) in tip.iter().take(128).enumerate() {
+                nid.szTip[i] = *c;
+            }
+            Shell_NotifyIconW(NIM_ADD, &nid);
+        }
+        Ok(Self { hwnd })
+    }
+
+    pub fn update_tooltip(&self, text: &str) {
+        let mut nid = NOTIFYICONDATAW::default();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = self.hwnd;
+        nid.uID = TRAY_ID;
+        nid.uFlags = NIF_TIP;
+        let mut tip = text.encode_utf16().collect::<Vec<u16>>();
+        tip.push(0);
+        tip.truncate(128);
+        for (i, c) in tip.iter().enumerate() {
+            nid.szTip[i] = *c;
+        }
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
+
+    pub fn remove(&self) {
+        let mut nid = NOTIFYICONDATAW::default();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = self.hwnd;
+        nid.uID = TRAY_ID;
+        unsafe {
+            Shell_NotifyIconW(NIM_DELETE, &nid);
+        }
+    }
+}
