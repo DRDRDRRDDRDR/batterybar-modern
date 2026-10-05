@@ -170,18 +170,35 @@ fn main() -> windows_core::Result<()> {
     Ok(())
 }
 
-/// 重新计算条的位置尺寸（任务栏内，托盘左侧）
+/// 重新计算条的位置尺寸：
+/// 横排任务栏 → 托盘左侧横条；竖排任务栏 → 托盘上方纵条。
+/// 注意：SetParent 后 SetWindowPos 用的是【父客户区坐标】，
+/// 也就是相对任务栏左上角的偏移，绝不能再加 trc.left/trc.top。
 fn relayout(bar: HWND) {
     unsafe {
         let parent = match GetParent(bar) {
             Ok(p) => p,
             Err(_) => return,
         };
-        let (x, cy) = taskbar::tray_left_estimate(parent);
-        let h = (cy - BAR_HEIGHT_PAD).max(12);
-        let _ = taskbar::place(bar, x - BAR_WIDTH - 6, (cy - h) / 2, BAR_WIDTH, h);
+        let mut trc = RECT::default();
+        if WAM::GetWindowRect(parent, &mut trc).is_err() {
+            return;
+        }
+        let tb_w = trc.right - trc.left;
+        let tb_h = trc.bottom - trc.top;
+        if tb_h > tb_w {
+            // 竖排：托盘区(TrayNotifyWnd)在底部，条放它上方，宽=任务栏宽
+            let (y, _unused) = taskbar::tray_left_estimate(parent); // y = 托盘顶(客户区坐标)
+            let _ = taskbar::place(bar, 0, y - BAR_HEIGHT_VERTICAL - 4, tb_w, BAR_HEIGHT_VERTICAL);
+        } else {
+            let (x, cy) = taskbar::tray_left_estimate(parent);
+            let h = (cy - BAR_HEIGHT_PAD).max(12);
+            let _ = taskbar::place(bar, x - BAR_WIDTH - 6, (cy - h) / 2, BAR_WIDTH, h);
+        }
     }
 }
+
+const BAR_HEIGHT_VERTICAL: i32 = 92; // 竖排条高（纵向条+上下文字区）
 
 unsafe extern "system" fn bar_wndproc(
     hwnd: HWND,
@@ -340,26 +357,19 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         render::rgb(0xF3, 0xF3, 0xF3)
     };
     render::fill_solid(hdc, rc, bg);
+    render::set_bk_transparent(hdc);
 
     let pct = power::PERCENT.load(Ordering::Relaxed);
     let w = rc.right - rc.left;
     let h = rc.bottom - rc.top;
-    let cy = rc.top + h / 2;
+    let vertical = h > w; // 竖排任务栏检测
 
     if pct < 0 {
         // 无电池：哑色短横线
-        render::fill_round(hdc, rc.left + 8, cy - 2, rc.right - 8, cy + 2, 2, pal.track);
+        render::fill_round(hdc, rc.left + 8, rc.top + h / 2 - 2, rc.right - 8, rc.top + h / 2 + 2, 2, pal.track);
         return;
     }
 
-    // 轨道
-    let bar_left = rc.left + 8;
-    let bar_right = rc.right - 8;
-    let bar_top = cy - 5;
-    let bar_bottom = cy + 5;
-    render::fill_round(hdc, bar_left, bar_top, bar_right, bar_bottom, 5, pal.track);
-
-    // 填充：充电 = 蓝；≤15% = 红；其余 蓝→绿 按电量插值
     let charging = power::CHARGING.load(Ordering::Relaxed);
     let fill = if charging {
         pal.fill
@@ -368,34 +378,144 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
     } else {
         lerp_color(pal.fill, render::rgb(0x4C, 0xAF, 0x50), pct as f32 / 100.0)
     };
+
+    if vertical {
+        paint_bar_vertical(hdc, rc, pct, charging, fill, &pal);
+    } else {
+        paint_bar_horizontal(hdc, rc, pct, charging, fill, &pal);
+    }
+}
+
+/// 竖排任务栏：纵向胶囊条 + 旋转 90° 的百分比文字
+unsafe fn paint_bar_vertical(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rc: &RECT,
+    pct: i32,
+    charging: bool,
+    fill: COLORREF,
+    pal: &Palette,
+) {
+    use windows::Win32::Graphics::Gdi::{GetTextExtentPoint32W, SetTextAlign, TextOutW, TA_CENTER};
+
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+
+    // 纵向轨道：宽 10px 居中，上下各留 14px 给旋转文字
+    let track_w = 10i32;
+    let cx = rc.left + w / 2;
+    let track_top = rc.top + 26;
+    let track_bottom = rc.bottom - 26;
+    if track_bottom - track_top < 20 {
+        return; // 任务栏太短
+    }
+    render::fill_round(hdc, cx - track_w / 2, track_top, cx + track_w / 2, track_bottom, 5, pal.track);
+
+    // 填充从底部往上
+    let span = (track_bottom - track_top) as i64;
+    let fw = (span * pct.clamp(2, 100) as i64 / 100) as i32;
+    if fw > 4 {
+        render::fill_round(
+            hdc,
+            cx - track_w / 2,
+            track_bottom - fw,
+            cx + track_w / 2,
+            track_bottom,
+            5,
+            fill,
+        );
+    }
+
+    // 旋转文字：world transform 90°，写完复原。
+    // 旋转后 (0,0) 映射到锚点 (cx, cy_text)，x 轴指向屏幕下方。
+    let font = render::create_ui_font(12, 600);
+    let old = SelectObject(hdc, font.into());
+    SetTextAlign(hdc, TA_CENTER);
+
+    let old_world = windows::Win32::Graphics::Gdi::SetGraphicsMode(
+        hdc,
+        windows::Win32::Graphics::Gdi::GM_ADVANCED,
+    );
+    let mut xform = windows::Win32::Graphics::Gdi::XFORM {
+        eM11: 0.0,
+        eM12: -1.0,
+        eM21: 1.0,
+        eM22: 0.0,
+        eDx: (cx + 7) as f32,  // 锚点移到条右侧空隙，避免字形压住胶囊
+        eDy: (rc.top + h / 2) as f32,
+    };
+    let _ = windows::Win32::Graphics::Gdi::SetWorldTransform(hdc, &xform);
+    // 设定世界变换后，逻辑坐标 (0,0) 即锚点；文字以 TA_CENTER 居中画在原点
+    let text = format!("{}%", pct);
+    let buf: Vec<u16> = text.encode_utf16().collect();
+    let _ = TextOutW(hdc, 0, 0, &buf);
+    // 复原
+    xform.eM11 = 1.0; xform.eM12 = 0.0; xform.eM21 = 0.0; xform.eM22 = 1.0; xform.eDx = 0.0; xform.eDy = 0.0;
+    let _ = windows::Win32::Graphics::Gdi::SetWorldTransform(hdc, &xform);
+    let _ = windows::Win32::Graphics::Gdi::SetGraphicsMode(
+        hdc,
+        windows::Win32::Graphics::Gdi::GRAPHICS_MODE(old_world),
+    );
+    let _ = SetTextAlign(hdc, windows::Win32::Graphics::Gdi::TEXT_ALIGN_OPTIONS(0));
+    SelectObject(hdc, old);
+    let _ = DeleteObject(font.into());
+
+    // 轨道描边
+    let pen = CreatePen(PS_SOLID, 1, if render::system_prefers_dark() { render::rgb(0x40, 0x40, 0x40) } else { render::rgb(0xC8, 0xC8, 0xC8) });
+    let old_pen = SelectObject(hdc, pen.into());
+    let _ = WAM_StrokeRect(hdc, cx - track_w / 2, track_top, cx + track_w / 2, track_bottom);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(pen.into());
+    let _ = charging;
+}
+
+/// 横排任务栏：原 v0.1 布局
+unsafe fn paint_bar_horizontal(
+    hdc: windows::Win32::Graphics::Gdi::HDC,
+    rc: &RECT,
+    pct: i32,
+    _charging: bool,
+    fill: COLORREF,
+    pal: &Palette,
+) {
+    use windows::Win32::Graphics::Gdi::GetTextExtentPoint32W;
+
+    let h = rc.bottom - rc.top;
+    let cy = rc.top + h / 2;
+
+    // 轨道
+    let bar_left = rc.left + 8;
+    let bar_right = rc.right - 8;
+    let bar_top = cy - 5;
+    let bar_bottom = cy + 5;
+    render::fill_round(hdc, bar_left, bar_top, bar_right, bar_bottom, 5, pal.track);
+
+    // 填充
     let span = (bar_right - bar_left) as i64;
     let fw = (span * pct.clamp(2, 100) as i64 / 100) as i32;
     if fw > 4 {
         render::fill_round(hdc, bar_left, bar_top, bar_left + fw, bar_bottom, 5, fill);
     }
 
-    // 居中百分比文字（白字，深色任务栏可读；浅色主题切黑字）
+    // 居中百分比文字
     let text = format!("{}%", pct);
     let mut buf: Vec<u16> = text.encode_utf16().collect();
-    SetTextColor(hdc, if dark { pal.text } else { pal.text });
+    render::set_text_color(hdc, pal.text);
     let font = render::create_ui_font(12, 600);
     let old = SelectObject(hdc, font.into());
-    let mut trc = RECT::default();
-    DrawTextW(hdc, &mut buf, &mut trc, DT_CALCRECT | DT_NOPREFIX | DT_SINGLELINE);
-    let tw = trc.right - trc.left;
-    let th = trc.bottom - trc.top;
+    let mut size = windows::Win32::Foundation::SIZE::default();
+    let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
     let mut drc = RECT {
-        left: (rc.left + rc.right) / 2 - tw / 2,
-        top: cy - th / 2,
-        right: (rc.left + rc.right) / 2 - tw / 2 + tw + 2,
-        bottom: cy - th / 2 + th + 2,
+        left: (rc.left + rc.right) / 2 - size.cx / 2,
+        top: cy - size.cy / 2,
+        right: (rc.left + rc.right) / 2 - size.cx / 2 + size.cx + 2,
+        bottom: cy - size.cy / 2 + size.cy + 2,
     };
     DrawTextW(hdc, &mut buf, &mut drc, DT_NOPREFIX | DT_SINGLELINE);
     SelectObject(hdc, old);
     let _ = DeleteObject(font.into());
 
     // 轨道描边（细线增强可读性）
-    let pen = CreatePen(PS_SOLID, 1, if dark { render::rgb(0x40, 0x40, 0x40) } else { render::rgb(0xC8, 0xC8, 0xC8) });
+    let pen = CreatePen(PS_SOLID, 1, if render::system_prefers_dark() { render::rgb(0x40, 0x40, 0x40) } else { render::rgb(0xC8, 0xC8, 0xC8) });
     let old_pen = SelectObject(hdc, pen.into());
     let _ = WAM_StrokeRect(hdc, bar_left, bar_top, bar_right, bar_bottom);
     SelectObject(hdc, old_pen);

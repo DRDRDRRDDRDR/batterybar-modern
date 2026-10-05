@@ -40,9 +40,9 @@ pub fn find_taskbars() -> Vec<TaskbarInfo> {
     }
 }
 
-/// 返回 (x, cy)：x 为条应放置的左边缘（任务栏客户区坐标），cy 为任务栏高度。
-/// Win10 结构：ReBarWindow32 的右边缘即托盘左缘。
-/// Win11 结构：TrayNotifyWnd 的左边缘。
+/// 定位锚点：
+/// 横排任务栏 → (x, cy)：x 为条左边缘（任务栏客户区坐标），cy 为任务栏高度。
+/// 竖排任务栏 → (y, 0)：y 为托盘区顶边（任务栏客户区坐标）。
 pub fn tray_left_estimate(taskbar: HWND) -> (i32, i32) {
     unsafe {
         let mut rc = RECT::default();
@@ -51,7 +51,21 @@ pub fn tray_left_estimate(taskbar: HWND) -> (i32, i32) {
 
         let mut tb = RECT::default();
         let _ = GetWindowRect(taskbar, &mut tb);
+        let vertical = (tb.bottom - tb.top) > (tb.right - tb.left);
 
+        // TrayNotifyWnd 两种布局下都存在，取它的矩形
+        let tray: PCWSTR = w!("TrayNotifyWnd");
+        if let Ok(h) = FindWindowExW(Some(taskbar), None, tray, PCWSTR::null()) {
+            let mut rr = RECT::default();
+            if GetWindowRect(h, &mut rr).is_ok() {
+                if vertical {
+                    return (rr.top - tb.top, 0); // 托盘顶边
+                }
+                return (rr.left - tb.left, cy);
+            }
+        }
+
+        // 横排 Win10 回落：ReBarWindow32 右缘
         let rebar: PCWSTR = w!("ReBarWindow32");
         if let Ok(h) = FindWindowExW(Some(taskbar), None, rebar, PCWSTR::null()) {
             let mut rr = RECT::default();
@@ -60,16 +74,12 @@ pub fn tray_left_estimate(taskbar: HWND) -> (i32, i32) {
             }
         }
 
-        let tray: PCWSTR = w!("TrayNotifyWnd");
-        if let Ok(h) = FindWindowExW(Some(taskbar), None, tray, PCWSTR::null()) {
-            let mut rr = RECT::default();
-            if GetWindowRect(h, &mut rr).is_ok() {
-                return (rr.left - tb.left, cy);
-            }
+        // 兜底：右端/底端留 200 物理像素
+        if vertical {
+            (rc.bottom - 200, 0)
+        } else {
+            (rc.right - 200, cy)
         }
-
-        // 兜底：右端留 200 物理像素
-        (rc.right - 200, cy)
     }
 }
 

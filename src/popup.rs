@@ -185,6 +185,8 @@ unsafe fn paint_popup(p: &Popup, hdc: HDC, rc: &RECT) {
 
     // 背景直接实心（窗口有 DWM 圆角，四角由 DWM 裁掉）
     FillRect(hdc, rc, CreateSolidBrush(pal.bg));
+    // 关键：透明背景，否则 DrawTextW 会把文字画成白底块
+    render::set_bk_transparent(hdc);
 
     let pct = power::PERCENT.load(Ordering::Relaxed);
     let charging = power::CHARGING.load(Ordering::Relaxed);

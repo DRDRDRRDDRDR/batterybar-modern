@@ -1,8 +1,16 @@
 # BatteryBar Modern
 
-现代开源版 BatteryBar：把电量条直接嵌进 Windows 10/11 任务栏，带系统托盘图标与详情弹窗。Rust + windows-rs 单文件实现，无运行时依赖。
+现代开源版 BatteryBar：把电量条直接嵌进 Windows 10/11 任务栏（横排/竖排任务栏均支持），带系统托盘图标与详情弹窗。Rust + windows-rs 单文件实现，无运行时依赖。
 
-![screenshot](shot_taskbar.png)
+![screenshot](shot_popup6.png)
+
+横排任务栏（v0.1）：
+
+![horizontal](shot_v01_horizontal.png)
+
+竖排任务栏（v0.2，纵向胶囊 + 自下而上填充 + 旋转百分比）：
+
+![vertical](shot_v4.png)
 
 ## 功能
 
@@ -30,8 +38,8 @@ cargo build --release
 
 ## 已知限制
 
-- 竖直任务栏：条按横向绘制（布局可用但宽度偏大），v0.2 适配竖排
 - 任务栏底色按主题近似贴色（#202020 / #F3F3F3），极端自定义主题下可能有轻微色差
+- 竖排条的旋转百分比文字位置在部分 DPI 下可能略贴近胶囊
 
 ## License
 
