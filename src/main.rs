@@ -1,25 +1,32 @@
 // batterybar-modern — 入口与主窗口（任务栏嵌入条）
 //
-// 三个窗口：
-//   1. bar window      —— 实际显示电量条的窗口，SetParent 进 Shell_TrayWnd
+// 窗口：
+//   1. bar window      —— 任务栏内嵌条（SetParent 进 Shell_TrayWnd）
 //   2. message window  —— 托盘图标宿主（不可见）
-//   3. popup window    —— 详情弹窗（popup.rs）
+//   3. popup window    —— Status Popup（原版 8 行字段复刻）
+//   4. prefs window    —— Preferences（原版 Preferences 复刻）
 #![allow(non_snake_case)]
 
+mod config;
 mod popup;
 mod power;
+mod prefs;
 mod render;
 mod taskbar;
 mod tray;
 
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, DeleteObject, DrawTextW, EndPaint, InvalidateRect, LineTo, MoveToEx,
-    SelectObject, SetTextColor, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE, PAINTSTRUCT, PS_SOLID,
+    BeginPaint, CreatePen, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect, LineTo,
+    MoveToEx, SelectObject, SetTextColor, DT_NOPREFIX, DT_SINGLELINE, PAINTSTRUCT, PS_SOLID,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging as WAM;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
@@ -31,27 +38,61 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_core::{w, PCWSTR};
 
+use crate::config::{Config, DisplayMode};
 use crate::render::{palette_dark, palette_light, Palette};
 
-// ---- 配置常量（后续可提为 options.json）----
-const BAR_WIDTH: i32 = 132; // 物理像素
-const BAR_HEIGHT_PAD: i32 = 10; // 条高 = 任务栏高 - 2*PAD
-const TIMER_REFRESH: usize = 1; // 周期刷新
+// ---- 布局常量 ----
+const BAR_WIDTH: i32 = 150;
+const BAR_HEIGHT_PAD: i32 = 10;
+const BAR_HEIGHT_VERTICAL: i32 = 92;
+const TIMER_REFRESH: usize = 1;
+const TIMER_HOVER: usize = 3;
 const REFRESH_MS: u32 = 1000;
+const HOVER_MS: u32 = 400;
 const TRAY_TIMER: usize = 2;
 const TRAY_POLL_MS: u32 = 30_000;
 
-const ID_MENU_EXIT: usize = 0x1001;
-const ID_MENU_TOGGLE: usize = 0x1002;
+// 菜单 ID
+const ID_MENU_MODE_TIME: usize = 0x1010;
+const ID_MENU_MODE_PCT: usize = 0x1011;
+const ID_MENU_MODE_ICON: usize = 0x1012;
+const ID_MENU_PREFS: usize = 0x1013;
+const ID_MENU_TOGGLE: usize = 0x1014;
+const ID_MENU_EXIT: usize = 0x1015;
 
-struct BarWnd {
-    hwnd: HWND,
-}
-
+// ---- 全局状态 ----
 static BAR_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static REFRESH_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static LAST_SIG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
+static DISPLAY_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // 0=time 1=percent 2=icon
+static HOVER_TRACKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+static CONFIG: OnceLock<Mutex<Config>> = OnceLock::new();
+
+pub fn config_lock() -> &'static Mutex<Config> {
+    CONFIG.get_or_init(|| Mutex::new(Config::load()))
+}
+
+pub fn set_mode(m: DisplayMode) {
+    DISPLAY_MODE.store(match m {
+        DisplayMode::TimeRemaining => 0,
+        DisplayMode::Percent => 1,
+        DisplayMode::Icon => 2,
+    }, Ordering::Relaxed);
+}
+
+fn mode_now() -> DisplayMode {
+    match DISPLAY_MODE.load(Ordering::Relaxed) {
+        1 => DisplayMode::Percent,
+        2 => DisplayMode::Icon,
+        _ => DisplayMode::TimeRemaining,
+    }
+}
+
+struct BarWnd {
+    hwnd: HWND,
+}
 
 fn main() -> windows_core::Result<()> {
     render::enable_dpi_awareness();
@@ -171,9 +212,7 @@ fn main() -> windows_core::Result<()> {
 }
 
 /// 重新计算条的位置尺寸：
-/// 横排任务栏 → 托盘左侧横条；竖排任务栏 → 托盘上方纵条。
-/// 注意：SetParent 后 SetWindowPos 用的是【父客户区坐标】，
-/// 也就是相对任务栏左上角的偏移，绝不能再加 trc.left/trc.top。
+/// 横排任务栏 → 托盘左侧横条；竖排任务栏 → 托盘上方饱满横向卡片（原版风格）。
 fn relayout(bar: HWND) {
     unsafe {
         let parent = match GetParent(bar) {
@@ -187,9 +226,10 @@ fn relayout(bar: HWND) {
         let tb_w = trc.right - trc.left;
         let tb_h = trc.bottom - trc.top;
         if tb_h > tb_w {
-            // 竖排：托盘区(TrayNotifyWnd)在底部，条放它上方，宽=任务栏宽
-            let (y, _unused) = taskbar::tray_left_estimate(parent); // y = 托盘顶(客户区坐标)
-            let _ = taskbar::place(bar, 0, y - BAR_HEIGHT_VERTICAL - 4, tb_w, BAR_HEIGHT_VERTICAL);
+            // 竖排任务栏：宽度填满任务栏宽度，高度为优雅的 38px 卡片，位于托盘上方
+            let bar_h = 38i32;
+            let (y, _unused) = taskbar::tray_left_estimate(parent);
+            let _ = taskbar::place(bar, 0, y - bar_h - 4, tb_w, bar_h);
         } else {
             let (x, cy) = taskbar::tray_left_estimate(parent);
             let h = (cy - BAR_HEIGHT_PAD).max(12);
@@ -197,8 +237,6 @@ fn relayout(bar: HWND) {
         }
     }
 }
-
-const BAR_HEIGHT_VERTICAL: i32 = 92; // 竖排条高（纵向条+上下文字区）
 
 unsafe extern "system" fn bar_wndproc(
     hwnd: HWND,
@@ -214,16 +252,52 @@ unsafe extern "system" fn bar_wndproc(
         WAM::WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
-            paint_bar(hdc, &ps.rcPaint);
+            let mut client_rc = RECT::default();
+            let _ = WAM::GetClientRect(hwnd, &mut client_rc);
+            paint_bar(hdc, &client_rc);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WAM::WM_LBUTTONUP => {
-            popup::toggle_popup();
+            // 原版行为：点击切换 时间/百分比 显示
+            let cfg = config_lock();
+            let (alt, cur) = {
+                let c = cfg.lock().unwrap();
+                (c.alternate_on_click, mode_now())
+            };
+            if alt {
+                set_mode(match cur {
+                    DisplayMode::Percent => DisplayMode::TimeRemaining,
+                    _ => DisplayMode::Percent,
+                });
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
             LRESULT(0)
         }
         WAM::WM_RBUTTONUP => {
             show_bar_menu(hwnd);
+            LRESULT(0)
+        }
+        0x0200 /* WM_MOUSEMOVE */ => {
+            // hover 唤起 Status Popup（原版 tooltip 行为）
+            if !HOVER_TRACKED.swap(true, Ordering::Relaxed) {
+                unsafe {
+                    let mut tme = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    let _ = TrackMouseEvent(&mut tme);
+                }
+                let _ = SetTimer(Some(hwnd), TIMER_HOVER, HOVER_MS, None);
+            }
+            LRESULT(0)
+        }
+        0x02A2 /* WM_MOUSELEAVE */ => {
+            HOVER_TRACKED.store(false, Ordering::Relaxed);
+            let _ = KillTimer(Some(hwnd), TIMER_HOVER);
+            popup::close_popup();
             LRESULT(0)
         }
         WAM::WM_TIMER => {
@@ -244,6 +318,17 @@ unsafe extern "system" fn bar_wndproc(
                         let t = tray::TrayIcon { hwnd: HWND(th as *mut _) };
                         t.update_tooltip(&tip);
                     }
+                }
+                check_notifications(pct as i32, chg != 0);
+            } else if wparam.0 == TIMER_HOVER {
+                // hover 计时到：光标仍在条上则弹详情
+                let _ = KillTimer(Some(hwnd), TIMER_HOVER);
+                let mut pt = POINT::default();
+                let _ = WAM::GetCursorPos(&mut pt);
+                let mut rc = RECT::default();
+                let _ = WAM::GetWindowRect(hwnd, &mut rc);
+                if pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom {
+                    popup::toggle_popup();
                 }
             }
             LRESULT(0)
@@ -267,8 +352,17 @@ unsafe extern "system" fn bar_wndproc(
 fn show_bar_menu(hwnd: HWND) {
     unsafe {
         if let Ok(menu) = CreatePopupMenu() {
-            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_TOGGLE, w!("显示/隐藏"));
-            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_EXIT, w!("退出"));
+            let cur = mode_now();
+            let mark = |on: bool| -> MENU_ITEM_FLAGS {
+                if on { MENU_ITEM_FLAGS(0x8 | 0x1) /* MF_CHECKED | MF_STRING */ } else { MENU_ITEM_FLAGS(0x1) }
+            };
+            let _ = AppendMenuW(menu, mark(cur == DisplayMode::TimeRemaining), ID_MENU_MODE_TIME, w!("显示时间剩余"));
+            let _ = AppendMenuW(menu, mark(cur == DisplayMode::Percent), ID_MENU_MODE_PCT, w!("显示百分比"));
+            let _ = AppendMenuW(menu, mark(cur == DisplayMode::Icon), ID_MENU_MODE_ICON, w!("只显示图标"));
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x800) /* MF_SEPARATOR */, 0, PCWSTR::null());
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x1), ID_MENU_PREFS, w!("Preferences..."));
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x1), ID_MENU_TOGGLE, w!("显示/隐藏条"));
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x1), ID_MENU_EXIT, w!("退出"));
             let mut pt = POINT::default();
             let _ = WAM::GetCursorPos(&mut pt);
             SetForegroundWindow(hwnd);
@@ -283,6 +377,69 @@ fn show_bar_menu(hwnd: HWND) {
             );
             let _ = DestroyMenu(menu);
         }
+    }
+}
+
+/// 低电/临界/满电 通知（原版 Notifications + Warning Levels）
+fn check_notifications(pct: i32, charging: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering as O};
+    let cfg = config_lock();
+    let (low, crit, n_low, n_crit, n_full, hide_full) = {
+        let c = cfg.lock().unwrap();
+        (c.low_percent, c.critical_percent, c.notify_low, c.notify_critical, c.notify_full, c.hide_when_full)
+    };
+
+    // 满电隐藏
+    if hide_full {
+        let bh = BAR_HWND.load(Ordering::Relaxed);
+        if bh != 0 {
+            let bar = HWND(bh as *mut _);
+            let should_hide = pct >= 100 && charging;
+            let vis = unsafe { IsWindowVisible(bar).as_bool() };
+            if should_hide && vis {
+                unsafe { let _ = ShowWindow(bar, SW_HIDE); }
+            } else if !should_hide && !vis {
+                unsafe { let _ = ShowWindow(bar, SW_SHOW); }
+            }
+        }
+    }
+
+    static FULL_LATCH: AtomicBool = AtomicBool::new(false);
+    static LOW_LATCH: AtomicBool = AtomicBool::new(false);
+    static CRIT_LATCH: AtomicBool = AtomicBool::new(false);
+
+    let th = TRAY_HWND.load(Ordering::Relaxed);
+    if th == 0 {
+        return;
+    }
+    let t = tray::TrayIcon { hwnd: HWND(th as *mut _) };
+
+    // 满电：充+满 边沿触发
+    if n_full && pct >= 100 && charging {
+        if !FULL_LATCH.swap(true, O::Relaxed) {
+            t.balloon("BatteryBar Modern", "电池已充满，可以拔掉电源了。",
+                windows::Win32::UI::Shell::NIIF_INFO);
+        }
+    } else if pct < 100 {
+        FULL_LATCH.store(false, O::Relaxed);
+    }
+    // 临界：放+≤crit 边沿
+    if n_crit && !charging && pct <= crit {
+        if !CRIT_LATCH.swap(true, O::Relaxed) {
+            t.balloon("电量临界", &format!("电池仅剩 {}%，请立即接通电源！", pct),
+                windows::Win32::UI::Shell::NIIF_WARNING);
+        }
+    } else if charging || pct > crit {
+        CRIT_LATCH.store(false, O::Relaxed);
+    }
+    // 低电：放+≤low 边沿
+    if n_low && !charging && pct <= low {
+        if !LOW_LATCH.swap(true, O::Relaxed) {
+            t.balloon("电量不足", &format!("电池仅剩 {}%，建议接通电源。", pct),
+                windows::Win32::UI::Shell::NIIF_WARNING);
+        }
+    } else if charging || pct > low {
+        LOW_LATCH.store(false, O::Relaxed);
     }
 }
 
@@ -319,6 +476,37 @@ unsafe extern "system" fn msg_wndproc(
                 let _ = PostQuitMessage(0);
                 LRESULT(0)
             }
+            ID_MENU_PREFS => {
+                prefs::toggle_prefs();
+                LRESULT(0)
+            }
+            ID_MENU_MODE_TIME => {
+                set_mode(DisplayMode::TimeRemaining);
+                save_mode();
+                let bh = BAR_HWND.load(Ordering::Relaxed);
+                if bh != 0 {
+                    let _ = InvalidateRect(Some(HWND(bh as *mut _)), None, false);
+                }
+                LRESULT(0)
+            }
+            ID_MENU_MODE_PCT => {
+                set_mode(DisplayMode::Percent);
+                save_mode();
+                let bh = BAR_HWND.load(Ordering::Relaxed);
+                if bh != 0 {
+                    let _ = InvalidateRect(Some(HWND(bh as *mut _)), None, false);
+                }
+                LRESULT(0)
+            }
+            ID_MENU_MODE_ICON => {
+                set_mode(DisplayMode::Icon);
+                save_mode();
+                let bh = BAR_HWND.load(Ordering::Relaxed);
+                if bh != 0 {
+                    let _ = InvalidateRect(Some(HWND(bh as *mut _)), None, false);
+                }
+                LRESULT(0)
+            }
             ID_MENU_TOGGLE => {
                 let bh = BAR_HWND.load(Ordering::Relaxed);
                 if bh != 0 {
@@ -347,179 +535,170 @@ unsafe extern "system" fn msg_wndproc(
 }
 
 unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
+    use windows::Win32::Graphics::Gdi::{GetTextExtentPoint32W, SetTextColor, SelectObject, DeleteObject};
+
     let dark = render::system_prefers_dark();
     let pal: Palette = if dark { palette_dark() } else { palette_light() };
+    let cfg = config_lock();
+    let c = cfg.lock().unwrap();
 
-    // Win11 任务栏底色：深色主题 ≈ #202020，浅色 ≈ #F3F3F3；直接贴同色实现"透明"
-    let bg = if dark {
-        render::rgb(0x20, 0x20, 0x20)
-    } else {
-        render::rgb(0xF3, 0xF3, 0xF3)
-    };
+    // 任务栏底色铺底
+    let (tr, tg, tb) = if dark { c.dark_taskbar_tint } else { c.light_taskbar_tint };
+    let bg = render::rgb(tr, tg, tb);
     render::fill_solid(hdc, rc, bg);
     render::set_bk_transparent(hdc);
 
     let pct = power::PERCENT.load(Ordering::Relaxed);
-    let w = rc.right - rc.left;
-    let h = rc.bottom - rc.top;
-    let vertical = h > w; // 竖排任务栏检测
+    let charging = power::CHARGING.load(Ordering::Relaxed);
 
-    if pct < 0 {
-        // 无电池：哑色短横线
-        render::fill_round(hdc, rc.left + 8, rc.top + h / 2 - 2, rc.right - 8, rc.top + h / 2 + 2, 2, pal.track);
+    // 电池卡片矩形（无论横竖，卡片四周均留精致微内边距）
+    let pad_x = 5i32;
+    let pad_y = 3i32;
+    let card_l = rc.left + pad_x;
+    let card_t = rc.top + pad_y;
+    let card_r = rc.right - pad_x;
+    let card_b = rc.bottom - pad_y;
+
+    if card_r <= card_l + 10 || card_b <= card_t + 10 {
         return;
     }
 
-    let charging = power::CHARGING.load(Ordering::Relaxed);
+    // 1. 底槽（Track / Background）
+    let track_bg = if dark { render::rgb(36, 44, 52) } else { render::rgb(225, 230, 236) };
+    render::fill_round(hdc, card_l, card_t, card_r, card_b, 5, track_bg);
+
+    // 2. 状态配色与进度填充
     let fill = if charging {
-        pal.fill
-    } else if pct <= 15 {
-        pal.fill_low
+        render::rgb(76, 175, 80) // 经典饱满翠绿 (Charging)
+    } else if pct <= c.critical_percent {
+        render::rgb(244, 67, 54) // 警示红 (Critical)
+    } else if pct <= c.low_percent {
+        render::rgb(255, 152, 0) // 琥珀金/橙 (Low)
     } else {
-        lerp_color(pal.fill, render::rgb(0x4C, 0xAF, 0x50), pct as f32 / 100.0)
+        render::rgb(41, 182, 246) // 经典清爽天蓝 (Discharging)
     };
 
-    if vertical {
-        paint_bar_vertical(hdc, rc, pct, charging, fill, &pal);
+    let card_w = (card_r - card_l) as i64;
+    let valid_pct = if pct < 0 { 0 } else { pct.clamp(0, 100) };
+    let fill_w = (card_w * valid_pct as i64 / 100) as i32;
+    if fill_w > 4 {
+        render::fill_round(hdc, card_l, card_t, card_l + fill_w, card_b, 5, fill);
+    }
+
+    // 3. 边框线（微质感轮廓）
+    let border_color = if dark { render::rgb(56, 68, 80) } else { render::rgb(195, 205, 215) };
+    let pen = CreatePen(PS_SOLID, 1, border_color);
+    let old_pen = SelectObject(hdc, pen.into());
+    let _ = WAM_StrokeRect(hdc, card_l, card_t, card_r, card_b);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(pen.into());
+
+    // 4. 文字内容构建
+    let eta = power::ETA_SECONDS.load(Ordering::Relaxed);
+    let show_time = c.default_mode == DisplayMode::TimeRemaining;
+
+    let text = if c.default_mode == DisplayMode::Icon {
+        String::new()
+    } else if pct < 0 {
+        "—".to_string()
+    } else if show_time {
+        if charging {
+            if eta > 0 {
+                format!("⚡ {}:{:02}", eta / 3600, (eta % 3600) / 60)
+            } else {
+                format!("⚡ {}%", pct)
+            }
+        } else if eta > 0 {
+            format!("{}:{:02}", eta / 3600, (eta % 3600) / 60)
+        } else {
+            format!("{}%", pct)
+        }
     } else {
-        paint_bar_horizontal(hdc, rc, pct, charging, fill, &pal);
+        if charging {
+            format!("⚡ {}%", pct)
+        } else {
+            format!("{}%", pct)
+        }
+    };
+
+    if !text.is_empty() {
+        let mut buf: Vec<u16> = text.encode_utf16().collect();
+        let font = render::create_ui_font(13, 600);
+        let old_font = SelectObject(hdc, font.into());
+
+        let mut size = windows::Win32::Foundation::SIZE::default();
+        let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
+
+        let cx = (card_l + card_r) / 2;
+        let cy = (card_t + card_b) / 2;
+        let tx = cx - size.cx / 2;
+        let ty = cy - size.cy / 2;
+
+        // 阴影字（下偏 1px，黑底半透立体效果）
+        SetTextColor(hdc, render::rgb(0, 0, 0));
+        let mut drc_shadow = RECT {
+            left: tx + 1,
+            top: ty + 1,
+            right: tx + size.cx + 2,
+            bottom: ty + size.cy + 2,
+        };
+        DrawTextW(hdc, &mut buf, &mut drc_shadow, DT_NOPREFIX | DT_SINGLELINE);
+
+        // 主字（纯白高亮）
+        SetTextColor(hdc, render::rgb(255, 255, 255));
+        let mut drc_text = RECT {
+            left: tx,
+            top: ty,
+            right: tx + size.cx + 2,
+            bottom: ty + size.cy + 2,
+        };
+        DrawTextW(hdc, &mut buf, &mut drc_text, DT_NOPREFIX | DT_SINGLELINE);
+
+        SelectObject(hdc, old_font);
+        let _ = DeleteObject(font.into());
+    } else if c.default_mode == DisplayMode::Icon {
+        // 图标居中模式
+        let icon_w = 26i32;
+        let icon_h = 13i32;
+        let ix = (card_l + card_r) / 2 - icon_w / 2;
+        let iy = (card_t + card_b) / 2 - icon_h / 2;
+        draw_battery_icon(hdc, ix, iy, icon_w, icon_h, pct, charging, fill, &pal);
     }
 }
 
-/// 竖排任务栏：纵向胶囊条 + 旋转 90° 的百分比文字
-unsafe fn paint_bar_vertical(
+/// 画小电池图标：外壳 + 电量填充 + 充电闪电
+unsafe fn draw_battery_icon(
     hdc: windows::Win32::Graphics::Gdi::HDC,
-    rc: &RECT,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
     pct: i32,
     charging: bool,
     fill: COLORREF,
     pal: &Palette,
 ) {
-    use windows::Win32::Graphics::Gdi::{GetTextExtentPoint32W, SetTextAlign, TextOutW, TA_CENTER};
-
-    let w = rc.right - rc.left;
-    let h = rc.bottom - rc.top;
-
-    // 纵向轨道：宽 10px 居中，上下各留 14px 给旋转文字
-    let track_w = 10i32;
-    let cx = rc.left + w / 2;
-    let track_top = rc.top + 26;
-    let track_bottom = rc.bottom - 26;
-    if track_bottom - track_top < 20 {
-        return; // 任务栏太短
-    }
-    render::fill_round(hdc, cx - track_w / 2, track_top, cx + track_w / 2, track_bottom, 5, pal.track);
-
-    // 填充从底部往上
-    let span = (track_bottom - track_top) as i64;
-    let fw = (span * pct.clamp(2, 100) as i64 / 100) as i32;
-    if fw > 4 {
-        render::fill_round(
-            hdc,
-            cx - track_w / 2,
-            track_bottom - fw,
-            cx + track_w / 2,
-            track_bottom,
-            5,
-            fill,
-        );
-    }
-
-    // 旋转文字：world transform 90°，写完复原。
-    // 旋转后 (0,0) 映射到锚点 (cx, cy_text)，x 轴指向屏幕下方。
-    let font = render::create_ui_font(12, 600);
-    let old = SelectObject(hdc, font.into());
-    SetTextAlign(hdc, TA_CENTER);
-
-    let old_world = windows::Win32::Graphics::Gdi::SetGraphicsMode(
-        hdc,
-        windows::Win32::Graphics::Gdi::GM_ADVANCED,
-    );
-    let mut xform = windows::Win32::Graphics::Gdi::XFORM {
-        eM11: 0.0,
-        eM12: -1.0,
-        eM21: 1.0,
-        eM22: 0.0,
-        eDx: (cx + 7) as f32,  // 锚点移到条右侧空隙，避免字形压住胶囊
-        eDy: (rc.top + h / 2) as f32,
-    };
-    let _ = windows::Win32::Graphics::Gdi::SetWorldTransform(hdc, &xform);
-    // 设定世界变换后，逻辑坐标 (0,0) 即锚点；文字以 TA_CENTER 居中画在原点
-    let text = format!("{}%", pct);
-    let buf: Vec<u16> = text.encode_utf16().collect();
-    let _ = TextOutW(hdc, 0, 0, &buf);
-    // 复原
-    xform.eM11 = 1.0; xform.eM12 = 0.0; xform.eM21 = 0.0; xform.eM22 = 1.0; xform.eDx = 0.0; xform.eDy = 0.0;
-    let _ = windows::Win32::Graphics::Gdi::SetWorldTransform(hdc, &xform);
-    let _ = windows::Win32::Graphics::Gdi::SetGraphicsMode(
-        hdc,
-        windows::Win32::Graphics::Gdi::GRAPHICS_MODE(old_world),
-    );
-    let _ = SetTextAlign(hdc, windows::Win32::Graphics::Gdi::TEXT_ALIGN_OPTIONS(0));
-    SelectObject(hdc, old);
-    let _ = DeleteObject(font.into());
-
-    // 轨道描边
-    let pen = CreatePen(PS_SOLID, 1, if render::system_prefers_dark() { render::rgb(0x40, 0x40, 0x40) } else { render::rgb(0xC8, 0xC8, 0xC8) });
+    let body_w = w - 4; // 留 4px 给正极头
+    // 外壳（描边）
+    let pen = CreatePen(PS_SOLID, 1, pal.text_dim);
     let old_pen = SelectObject(hdc, pen.into());
-    let _ = WAM_StrokeRect(hdc, cx - track_w / 2, track_top, cx + track_w / 2, track_bottom);
+    let old_brush_hollow = {
+        use windows::Win32::Graphics::Gdi::{GetStockObject, HOLLOW_BRUSH};
+        SelectObject(hdc, GetStockObject(HOLLOW_BRUSH))
+    };
+    let _ = WAM_StrokeRect(hdc, x, y, x + body_w, y + h);
+    SelectObject(hdc, old_brush_hollow);
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(pen.into());
+    // 正极头
+    render::fill_round(hdc, x + body_w, y + h / 2 - 2, x + w, y + h / 2 + 2, 1, pal.text_dim);
+    // 内部填充（留 2px 内缩）
+    let frac = pct.clamp(0, 100) as i64;
+    let inner_w = ((body_w - 4) as i64 * frac / 100) as i32;
+    if inner_w > 2 {
+        render::fill_round(hdc, x + 2, y + 2, x + 2 + inner_w, y + h - 2, 1, fill);
+    }
     let _ = charging;
-}
-
-/// 横排任务栏：原 v0.1 布局
-unsafe fn paint_bar_horizontal(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
-    rc: &RECT,
-    pct: i32,
-    _charging: bool,
-    fill: COLORREF,
-    pal: &Palette,
-) {
-    use windows::Win32::Graphics::Gdi::GetTextExtentPoint32W;
-
-    let h = rc.bottom - rc.top;
-    let cy = rc.top + h / 2;
-
-    // 轨道
-    let bar_left = rc.left + 8;
-    let bar_right = rc.right - 8;
-    let bar_top = cy - 5;
-    let bar_bottom = cy + 5;
-    render::fill_round(hdc, bar_left, bar_top, bar_right, bar_bottom, 5, pal.track);
-
-    // 填充
-    let span = (bar_right - bar_left) as i64;
-    let fw = (span * pct.clamp(2, 100) as i64 / 100) as i32;
-    if fw > 4 {
-        render::fill_round(hdc, bar_left, bar_top, bar_left + fw, bar_bottom, 5, fill);
-    }
-
-    // 居中百分比文字
-    let text = format!("{}%", pct);
-    let mut buf: Vec<u16> = text.encode_utf16().collect();
-    render::set_text_color(hdc, pal.text);
-    let font = render::create_ui_font(12, 600);
-    let old = SelectObject(hdc, font.into());
-    let mut size = windows::Win32::Foundation::SIZE::default();
-    let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
-    let mut drc = RECT {
-        left: (rc.left + rc.right) / 2 - size.cx / 2,
-        top: cy - size.cy / 2,
-        right: (rc.left + rc.right) / 2 - size.cx / 2 + size.cx + 2,
-        bottom: cy - size.cy / 2 + size.cy + 2,
-    };
-    DrawTextW(hdc, &mut buf, &mut drc, DT_NOPREFIX | DT_SINGLELINE);
-    SelectObject(hdc, old);
-    let _ = DeleteObject(font.into());
-
-    // 轨道描边（细线增强可读性）
-    let pen = CreatePen(PS_SOLID, 1, if render::system_prefers_dark() { render::rgb(0x40, 0x40, 0x40) } else { render::rgb(0xC8, 0xC8, 0xC8) });
-    let old_pen = SelectObject(hdc, pen.into());
-    let _ = WAM_StrokeRect(hdc, bar_left, bar_top, bar_right, bar_bottom);
-    SelectObject(hdc, old_pen);
-    let _ = DeleteObject(pen.into());
 }
 
 unsafe fn WAM_StrokeRect(
@@ -550,4 +729,11 @@ fn lerp_color(a: COLORREF, b: COLORREF, t: f32) -> COLORREF {
     let g = (ag + (bg - ag) * t) as u32;
     let bl = (ab + (bb - ab) * t) as u32;
     COLORREF(r | (g << 8) | (bl << 16))
+}
+
+/// 菜单切模式后保存到 options.json
+fn save_mode() {
+    let cfg = config_lock();
+    let c = cfg.lock().unwrap().clone();
+    c.save();
 }

@@ -128,10 +128,13 @@ pub unsafe fn fill_round(
     radius: i32,
     color: COLORREF,
 ) {
+    use windows::Win32::Graphics::Gdi::{GetStockObject, NULL_PEN};
     let brush = CreateSolidBrush(color);
-    let old = SelectObject(hdc, brush.into());
+    let old_brush = SelectObject(hdc, brush.into());
+    let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
     let _ = RoundRect(hdc, left, top, right, bottom, radius * 2, radius * 2);
-    SelectObject(hdc, old);
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
     let _ = DeleteObject(brush.into());
 }
 

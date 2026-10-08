@@ -23,6 +23,14 @@ pub static FULL_MWH: AtomicI64 = AtomicI64::new(0);
 pub static DESIGN_MWH: AtomicI64 = AtomicI64::new(0);
 pub static ETA_SECONDS: AtomicU64 = AtomicU64::new(0); // 0 = 未知/满电
 pub static AVAILABLE: AtomicBool = AtomicBool::new(false); // 本机有无电池
+pub static FULL_LIFETIME_SECONDS: AtomicU64 = AtomicU64::new(0); // 满充可用时长(学习值)
+pub static ELAPSED_ON_BATTERY: AtomicU64 = AtomicU64::new(0); // 本次用电池已时长
+pub static VOLTAGE_MV: AtomicI32 = AtomicI32::new(0); // 电压(mV)
+
+// 通知状态沿（true = 该事件已触发过，状态切换后复位）
+pub static NOTIFY_LOW_LATCH: AtomicBool = AtomicBool::new(false);
+pub static NOTIFY_CRITICAL_LATCH: AtomicBool = AtomicBool::new(false);
+pub static NOTIFY_FULL_LATCH: AtomicBool = AtomicBool::new(false);
 
 // ---- ETA 估算（指数滑动平均，防跳变）----
 
@@ -38,11 +46,12 @@ struct EtaTracker {
     last_mwh: i64,
     rate_mwh_per_s: f64, // 滑动平均；充电为正
     charging: bool,
+    discharge_start: Option<(u64, i64)>, // (开始秒, 开始mWh)
 }
 
 impl EtaTracker {
     const fn new() -> Self {
-        Self { last_sec: 0, last_mwh: 0, rate_mwh_per_s: 0.0, charging: false }
+        Self { last_sec: 0, last_mwh: 0, rate_mwh_per_s: 0.0, charging: false, discharge_start: None }
     }
 
     fn feed(&mut self, sec: u64, mwh: i64, charging: bool) -> u64 {
@@ -86,9 +95,42 @@ impl EtaTracker {
         let eta = (rem as f64 / rate.abs()) as u64;
         eta.min(86_400) // 上限 24h，超出视为不可靠
     }
+
+    /// 放电区段记录：充电开始时把进行中的放电段写入历史文件。
+    fn track_discharge(&mut self, sec: u64, mwh: i64, charging: bool, full: i64) {
+        if charging {
+            if let Some(rec) = self.discharge_start.take() {
+                // 放电结束：落一条记录
+                if sec > rec.0 && full > 0 {
+                    let d = DischargeRecord {
+                        from_mwh: rec.1,
+                        to_mwh: mwh,
+                        seconds: sec - rec.0,
+                    };
+                    if d.seconds > 300 && d.to_mwh < d.from_mwh {
+                        append_history(&d);
+                    }
+                }
+            }
+        } else if self.discharge_start.is_none() {
+            self.discharge_start = Some((sec, mwh));
+        } else {
+            // 进行中：更新 last_sec 供 ELAPSED 使用
+            self.last_sec = sec;
+        }
+    }
 }
 
 static ETA: std::sync::Mutex<EtaTracker> = std::sync::Mutex::new(EtaTracker::new());
+
+// 历史学习：记录最近 N 次完整放电的 (起始%, 结束%, 秒数) 用于全寿命估算。
+// 持久化到 exe 同目录 battery_history.json（极简格式）。
+const HISTORY_MAX: usize = 32;
+struct DischargeRecord {
+    from_mwh: i64,
+    to_mwh: i64,
+    seconds: u64,
+}
 
 /// 把 BatteryReport 写入全局快照。
 pub fn apply_report(report: &BatteryReport) {
@@ -130,12 +172,23 @@ pub fn apply_report(report: &BatteryReport) {
     if full > 0 && rem >= 0 {
         let pct = ((rem as f64 / full as f64) * 100.0).round().clamp(0.0, 100.0) as i32;
         PERCENT.store(pct, Ordering::Relaxed);
+    } else {
+        sync_win32_power();
     }
 
     if let Ok(mut t) = ETA.lock() {
         let eta = t.feed(now_unix(), rem, charging || idle_ac);
         ETA_SECONDS.store(eta, Ordering::Relaxed);
+        // 全寿命学习值：EMA 的稳定速率下满电可用秒数
+        if t.rate_mwh_per_s > 1.0 && full > 0 {
+            let full_life = (full as f64 / t.rate_mwh_per_s) as u64;
+            FULL_LIFETIME_SECONDS.store(full_life.min(86_400 * 2), Ordering::Relaxed);
+        }
+        // 放电记录（充→放切换时开新记录，放→充切换时落盘）
+        t.track_discharge(now_unix(), rem, charging || idle_ac, full);
     }
+
+    ELAPSED_ON_BATTERY.store(if charging || idle_ac { 0 } else { now_unix().saturating_sub(ETA.lock().map(|t| t.last_sec).unwrap_or(now_unix())) }, Ordering::Relaxed);
 }
 
 /// 在 UI 线程调用一次（注册消息 + 订阅事件 + 首次取报告）。
@@ -149,6 +202,9 @@ pub fn init_battery(notify_hwnd: HWND) -> windows_core::Result<()> {
 
     let battery = Battery::AggregateBattery()?;
     let hwnd = notify_hwnd.0 as isize;
+
+    // 先立即用系统内核同步一次基础电量（确保持久保底可用）
+    sync_win32_power();
 
     // 立即取一次当前报告
     if let Ok(r) = battery.GetReport() {
@@ -174,13 +230,36 @@ pub fn init_battery(notify_hwnd: HWND) -> windows_core::Result<()> {
             Ok(())
         },
     );
-
     battery.ReportUpdated(&handler)?;
     Ok(())
 }
 
+/// 兜底 Win32 电源同步（直接读取系统内核，不依赖 WinRT 驱动汇报完整性）
+pub fn sync_win32_power() {
+    unsafe {
+        let mut sps = windows::Win32::System::Power::SYSTEM_POWER_STATUS::default();
+        if windows::Win32::System::Power::GetSystemPowerStatus(&mut sps).is_ok() {
+            if sps.BatteryLifePercent != 255 {
+                PERCENT.store(sps.BatteryLifePercent as i32, Ordering::Relaxed);
+            }
+            if sps.BatteryFlag != 128 {
+                AVAILABLE.store(true, Ordering::Relaxed);
+            }
+            if sps.ACLineStatus == 1 || (sps.BatteryFlag & 8) != 0 {
+                CHARGING.store(true, Ordering::Relaxed);
+            } else if sps.ACLineStatus == 0 {
+                CHARGING.store(false, Ordering::Relaxed);
+            }
+            if sps.BatteryLifeTime != u32::MAX && sps.BatteryLifeTime > 0 {
+                ETA_SECONDS.store(sps.BatteryLifeTime as u64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// 兜底轮询（在 WM_TIMER 里调用）：WinRT 事件偶发丢失时保证 30s 内必有刷新。
 pub fn poll_once() {
+    sync_win32_power();
     if let Ok(b) = Battery::AggregateBattery() {
         if let Ok(r) = b.GetReport() {
             apply_report(&r);
@@ -196,5 +275,68 @@ pub fn health_percent() -> i32 {
         ((full as f64 / design as f64) * 100.0).round().clamp(1.0, 100.0) as i32
     } else {
         0
+    }
+}
+
+// ---- 放电历史持久化（极简 JSONL：每行一条 JSON）----
+
+fn history_path() -> std::path::PathBuf {
+    let mut p = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    p.pop();
+    p.push("battery_history.jsonl");
+    p
+}
+
+fn append_history(d: &DischargeRecord) {
+    use std::io::Write;
+    let line = format!(
+        "{{\"from\":{},\"to\":{},\"sec\":{}}}\n",
+        d.from_mwh, d.to_mwh, d.seconds
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(history_path())
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+    trim_history();
+}
+
+/// 超过 HISTORY_MAX 行删最旧的
+fn trim_history() {
+    let Ok(content) = std::fs::read_to_string(history_path()) else { return };
+    let mut lines: Vec<&str> = content.lines().collect();
+    if lines.len() <= HISTORY_MAX {
+        return;
+    }
+    lines = lines[lines.len() - HISTORY_MAX..].to_vec();
+    let _ = std::fs::write(history_path(), lines.join("\n") + "\n");
+}
+
+/// 历史平均放电速率（mWh/s）；无数据返回 0
+pub fn learned_discharge_rate() -> f64 {
+    let Ok(content) = std::fs::read_to_string(history_path()) else { return 0.0 };
+    let mut total_mwh = 0i64;
+    let mut total_sec = 0u64;
+    for line in content.lines().rev().take(HISTORY_MAX) {
+        // 极简解析:{"from":N,"to":N,"sec":N}
+        let mut get = |key: &str| -> i64 {
+            line.split(&format!("\"{}\":", key))
+                .nth(1)
+                .and_then(|s| s.split(['}', ',']).next())
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0)
+        };
+        let from = get("from");
+        let to = get("to");
+        let sec = get("sec").max(1);
+        total_mwh += (from - to).max(0);
+        total_sec += sec as u64;
+    }
+    if total_sec > 0 {
+        total_mwh as f64 / total_sec as f64
+    } else {
+        0.0
     }
 }

@@ -1,6 +1,5 @@
-// batterybar-modern — 详情弹窗
-// 点击任务栏条/托盘图标弹出：大百分比 + 状态 + ETA + 电池健康。
-// 视觉基准：Telegram 弹出面板（圆角卡片、深色 #17212B、克制留白）。
+// batterybar-modern — Status Popup（原版复刻）
+// 原版字段：Percent / Time Remaining / Capacity / Discharge Rate / Battery / Full Lifetime / A/C / Battery Wear
 #![allow(non_snake_case)]
 
 use std::sync::atomic::Ordering;
@@ -11,8 +10,8 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, LineTo,
-    MoveToEx, SelectObject, SetTextColor, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE, DRAW_TEXT_FORMAT,
-    HGDIOBJ, HDC, PAINTSTRUCT, PS_SOLID,
+    MoveToEx, SelectObject, SetTextColor, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK,
+    DRAW_TEXT_FORMAT, HGDIOBJ, HDC, PAINTSTRUCT, PS_SOLID,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -23,21 +22,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows_core::{w, PCWSTR};
 
 use crate::power;
-use crate::render::{self, palette_dark, palette_light, Palette};
+use crate::render;
 
-const POPUP_W: i32 = 300;
-const POPUP_H: i32 = 170;
+const POPUP_W: i32 = 320;
+const ROW_H: i32 = 24;
+const POPUP_H: i32 = 44 + ROW_H * 8 + 14;
 const TIMER_ID: usize = 42;
 
 struct Popup {
-    palette: Palette,
-    font_big: windows::Win32::Graphics::Gdi::HFONT,
-    font_med: windows::Win32::Graphics::Gdi::HFONT,
-    font_small: windows::Win32::Graphics::Gdi::HFONT,
+    palette: render::Palette,
+    font_title: windows::Win32::Graphics::Gdi::HFONT,
+    font_key: windows::Win32::Graphics::Gdi::HFONT,
+    font_val: windows::Win32::Graphics::Gdi::HFONT,
 }
 
-// HFONT/HDC 等 raw handle 不是 Send/Sync；弹窗只在 UI 线程访问，
-// 用 unsafe 包装声明单线程约束（窗口销毁时不再读取）。
+// HFONT/HDC raw handle 不是 Send/Sync；弹窗只在 UI 线程访问。
 struct PopupBox(Popup);
 unsafe impl Send for PopupBox {}
 unsafe impl Sync for PopupBox {}
@@ -45,14 +44,14 @@ unsafe impl Sync for PopupBox {}
 static POPUP_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static POPUP_BOX: std::sync::OnceLock<PopupBox> = std::sync::OnceLock::new();
 
-/// 点击切换显示；已开则关。
+/// hover/点击唤起（已开则刷新位置）
 pub fn toggle_popup() {
     unsafe {
         let existing = POPUP_HWND.load(Ordering::Relaxed);
         if existing != 0 {
+            // 已开：只刷新数据（重绘），不关闭 —— hover 唤起时保持
             let hwnd = HWND(existing as *mut _);
-            let _ = DestroyWindow(hwnd);
-            POPUP_HWND.store(0, Ordering::Relaxed);
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
             return;
         }
 
@@ -71,23 +70,25 @@ pub fn toggle_popup() {
                 lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
                 ..Default::default()
             };
-            let atom = RegisterClassW(&wc);
-            OK = atom != 0;
+            OK = RegisterClassW(&wc) != 0;
         });
         if unsafe { !OK } {
             return;
         }
 
-        // 定位：光标上方，水平居中，贴屏幕边缘裁剪
+        // 定位：光标上方，贴屏幕边缘裁剪
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut pt);
         let (sw, sh) = render::screen_size();
-        let mut x = pt.x - POPUP_W / 2;
-        let mut y = pt.y - POPUP_H - 12;
+        let mut x = pt.x + 12;
+        let mut y = pt.y - POPUP_H - 8;
+        if x + POPUP_W > sw - 4 {
+            x = pt.x - POPUP_W - 12;
+        }
         x = x.clamp(4, sw - POPUP_W - 4);
         y = y.max(4);
         if y > sh - POPUP_H - 40 {
-            y = pt.y + 24;
+            y = pt.y + ROW_H + 4;
         }
 
         let hinstance = match GetModuleHandleW(PCWSTR::null()) {
@@ -96,7 +97,7 @@ pub fn toggle_popup() {
         };
         let class_name = w!("BBM_Popup");
         let dark = render::system_prefers_dark();
-        let palette = if dark { palette_dark() } else { palette_light() };
+        let palette = if dark { render::palette_dark() } else { render::palette_light() };
 
         let ex = WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
         let hwnd = match CreateWindowExW(
@@ -119,24 +120,29 @@ pub fn toggle_popup() {
 
         let _ = POPUP_BOX.set(PopupBox(Popup {
             palette,
-            font_big: render::create_ui_font(52, 600),
-            font_med: render::create_ui_font(18, 500),
-            font_small: render::create_ui_font(14, 400),
+            font_title: render::create_ui_font(16, 600),
+            font_key: render::create_ui_font(13, 400),
+            font_val: render::create_ui_font(13, 600),
         }));
 
         // Win11 圆角
         let pref = DWMWCP_ROUND.0;
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE,
-            &pref as *const i32 as *const _,
-            4,
-        );
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const i32 as *const _, 4);
 
         POPUP_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
-        let _ = SetTimer(Some(hwnd), TIMER_ID, 5000, None); // 5s 自动消失
+        let _ = SetTimer(Some(hwnd), TIMER_ID, 6000, None); // 6s 自动消失
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-        let _ = SetForegroundWindow(hwnd); // 临时提权把 NOACTIVATE 窗口带到最前
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+pub fn close_popup() {
+    let existing = POPUP_HWND.load(Ordering::Relaxed);
+    if existing != 0 {
+        unsafe {
+            let _ = DestroyWindow(HWND(existing as *mut _));
+        }
+        POPUP_HWND.store(0, Ordering::Relaxed);
     }
 }
 
@@ -158,15 +164,14 @@ unsafe extern "system" fn popup_wndproc(
         }
         0x0113 /* WM_TIMER */ => {
             if wparam.0 == TIMER_ID {
-                let _ = Kill_Timer(hwnd);
+                let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_ID);
                 POPUP_HWND.store(0, Ordering::Relaxed);
                 let _ = DestroyWindow(hwnd);
             }
             LRESULT(0)
         }
-        0x0201 /* WM_LBUTTONDOWN */ | 0x0204 /* WM_RBUTTONDOWN */ | 0x0084 if false => LRESULT(0),
-        0x0201 | 0x0204 => {
-            let _ = Kill_Timer(hwnd);
+        0x0201 /* WM_LBUTTONDOWN */ | 0x0204 /* WM_RBUTTONDOWN */ => {
+            let _ = windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_ID);
             POPUP_HWND.store(0, Ordering::Relaxed);
             let _ = DestroyWindow(hwnd);
             LRESULT(0)
@@ -176,99 +181,84 @@ unsafe extern "system" fn popup_wndproc(
     }
 }
 
-unsafe fn Kill_Timer(hwnd: HWND) -> windows_core::Result<()> {
-    windows::Win32::UI::WindowsAndMessaging::KillTimer(Some(hwnd), TIMER_ID)
+struct Row {
+    key: &'static str,
+    val: String,
+    color: Option<windows::Win32::Foundation::COLORREF>,
 }
 
 unsafe fn paint_popup(p: &Popup, hdc: HDC, rc: &RECT) {
     let pal = &p.palette;
-
-    // 背景直接实心（窗口有 DWM 圆角，四角由 DWM 裁掉）
     FillRect(hdc, rc, CreateSolidBrush(pal.bg));
-    // 关键：透明背景，否则 DrawTextW 会把文字画成白底块
     render::set_bk_transparent(hdc);
 
     let pct = power::PERCENT.load(Ordering::Relaxed);
     let charging = power::CHARGING.load(Ordering::Relaxed);
     let eta = power::ETA_SECONDS.load(Ordering::Relaxed);
+    let full_life = power::FULL_LIFETIME_SECONDS.load(Ordering::Relaxed);
+    let elapsed = power::ELAPSED_ON_BATTERY.load(Ordering::Relaxed);
+    let rate = power::CHARGE_RATE_MW.load(Ordering::Relaxed);
+    let rem = power::REMAIN_MWH.load(Ordering::Relaxed);
+    let full = power::FULL_MWH.load(Ordering::Relaxed);
     let health = power::health_percent();
 
-    // 左侧大数字
-    let mut big: Vec<u16> = if pct < 0 {
-        "—".encode_utf16().collect()
-    } else {
-        format!("{}%", pct).encode_utf16().collect()
+    let fmt_hms = |s: u64| -> String {
+        if s == 0 { "—".into() } else { format!("{}h {:02}m", s / 3600, (s % 3600) / 60) }
     };
-    let fill = if charging {
-        pal.fill
-    } else if (0..=15).contains(&pct) {
-        pal.fill_low
-    } else {
-        pal.fill
-    };
-    SetTextColor(hdc, fill);
-    let old = SelectObject(hdc, p.font_big.into());
-    let mut rc_m = RECT { left: 24, top: 18, right: 170, bottom: 110 };
-    let mut buf = big.clone();
-    DrawTextW(hdc, &mut buf, &mut rc_m, DT_CALCRECT_FLAG() | DT_NOPREFIX | DT_SINGLELINE);
-    let w = rc_m.right - rc_m.left;
-    let h = rc_m.bottom - rc_m.top;
-    let mut rc_d = RECT { left: 24, top: 18, right: 24 + w, bottom: 18 + h };
-    DrawTextW(hdc, &mut big, &mut rc_d, DT_NOPREFIX | DT_SINGLELINE);
 
-    // 右侧状态文本
+    let state_color = if charging {
+        render::rgb(0x6D, 0xC2, 0x4B)
+    } else if (0..=10).contains(&pct) {
+        render::rgb(0xE0, 0x48, 0x38)
+    } else if (0..=20).contains(&pct) {
+        render::rgb(0xF0, 0xA0, 0x30)
+    } else {
+        render::rgb(0x33, 0xC5, 0xF0)
+    };
+
+    let rows = [
+        Row { key: "电量", val: if pct < 0 { "—".into() } else { format!("{}%", pct) }, color: Some(state_color) },
+        Row { key: "剩余时间", val: if charging { fmt_hms(eta) .replace("—", "充电中") } else { fmt_hms(eta) }, color: None },
+        Row { key: "容量", val: if full > 0 { format!("{} / {} mWh", rem, full) } else { "—".into() }, color: None },
+        Row { key: if charging { "充电速率" } else { "放电速率" }, val: format!("{} mW", rate), color: None },
+        Row { key: "电池状态", val: if charging { "充电中 ⚡".into() } else if pct >= 100 { "已充满".into() } else { "使用电池".into() }, color: None },
+        Row { key: "满电可用", val: fmt_hms(full_life), color: None },
+        Row { key: "电源", val: if charging { "A/C 已接通".into() } else { "使用电池".into() }, color: None },
+        Row { key: "电池损耗", val: if health > 0 { format!("{}%（健康 {}%）", 100 - health, health) } else { "—".into() }, color: None },
+    ];
+
+    // 标题
     SetTextColor(hdc, pal.text);
-    SelectObject(hdc, p.font_med.into());
-    let status = if !power::AVAILABLE.load(Ordering::Relaxed) {
-        "未检测到电池".to_string()
-    } else if charging {
-        "充电中 ⚡".to_string()
-    } else if pct >= 100 {
-        "已充满".to_string()
-    } else {
-        "使用电池".to_string()
-    };
-    let mut st: Vec<u16> = status.encode_utf16().collect();
-    let mut rc_st = RECT { left: 160, top: 34, right: POPUP_W - 20, bottom: 62 };
-    DrawTextW(hdc, &mut st, &mut rc_st, DT_NOPREFIX | DT_SINGLELINE);
-
-    // ETA 行
-    SetTextColor(hdc, pal.text_dim);
-    SelectObject(hdc, p.font_small.into());
-    let eta_text = if eta > 0 && power::AVAILABLE.load(Ordering::Relaxed) {
-        let hh = (eta / 3600) as i32;
-        let mm = ((eta % 3600) / 60) as i32;
-        if charging {
-            format!("约 {}小时{:02}分充满", hh, mm)
-        } else {
-            format!("剩余约 {}小时{:02}分", hh, mm)
-        }
-    } else {
-        "—".to_string()
-    };
-    let mut eta_w: Vec<u16> = eta_text.encode_utf16().collect();
-    let mut rc_eta = RECT { left: 160, top: 62, right: POPUP_W - 20, bottom: 86 };
-    DrawTextW(hdc, &mut eta_w, &mut rc_eta, DT_NOPREFIX | DT_SINGLELINE);
+    SelectObject(hdc, p.font_title.into());
+    let mut title: Vec<u16> = "BatteryBar Modern".encode_utf16().collect();
+    let mut trc = RECT { left: 16, top: 10, right: POPUP_W - 16, bottom: 34 };
+    DrawTextW(hdc, &mut title, &mut trc, DT_NOPREFIX | DT_SINGLELINE);
 
     // 分隔线
     let pen = CreatePen(PS_SOLID, 1, pal.track);
     let old_pen = SelectObject(hdc, pen.into());
-    let _ = MoveToEx(hdc, 24, 104, None);
-    let _ = LineTo(hdc, POPUP_W - 24, 104);
+    let _ = MoveToEx(hdc, 16, 38, None);
+    let _ = LineTo(hdc, POPUP_W - 16, 38);
     SelectObject(hdc, old_pen);
     let _ = DeleteObject(HGDIOBJ(pen.0));
 
-    // 底部信息行：健康度
-    SetTextColor(hdc, pal.text_dim);
-    SelectObject(hdc, p.font_small.into());
-    let cap_text = format!("电池健康 {}%", health);
-    let mut info: Vec<u16> = cap_text.encode_utf16().collect();
-    let mut rc_info = RECT { left: 24, top: 116, right: POPUP_W - 24, bottom: 142 };
-    DrawTextW(hdc, &mut info, &mut rc_info, DT_NOPREFIX | DT_SINGLELINE);
-
-    SelectObject(hdc, old);
-}
-
-const fn DT_CALCRECT_FLAG() -> DRAW_TEXT_FORMAT {
-    DT_CALCRECT
+    // 行
+    let mut y = 44;
+    for (i, row) in rows.iter().enumerate() {
+        let row_y = y + i as i32 * ROW_H;
+        // key
+        SetTextColor(hdc, pal.text_dim);
+        SelectObject(hdc, p.font_key.into());
+        let mut k: Vec<u16> = row.key.encode_utf16().collect();
+        let mut krc = RECT { left: 16, top: row_y, right: 120, bottom: row_y + ROW_H };
+        DrawTextW(hdc, &mut k, &mut krc, DT_NOPREFIX | DT_SINGLELINE);
+        // val
+        SetTextColor(hdc, row.color.unwrap_or(pal.text));
+        SelectObject(hdc, p.font_val.into());
+        let mut v: Vec<u16> = row.val.encode_utf16().collect();
+        let mut vrc = RECT { left: 124, top: row_y, right: POPUP_W - 16, bottom: row_y + ROW_H };
+        DrawTextW(hdc, &mut v, &mut vrc, DT_NOPREFIX | DT_SINGLELINE);
+    }
+    let _ = DT_WORDBREAK;
+    let _ = DT_CALCRECT;
 }

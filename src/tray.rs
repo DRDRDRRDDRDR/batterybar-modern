@@ -82,4 +82,29 @@ impl TrayIcon {
             Shell_NotifyIconW(NIM_DELETE, &nid);
         }
     }
+
+    /// 气泡通知（低电/临界/满电）
+    pub fn balloon(&self, title: &str, text: &str, flag: windows::Win32::UI::Shell::NOTIFY_ICON_INFOTIP_FLAGS) {
+        let mut nid = NOTIFYICONDATAW::default();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = self.hwnd;
+        nid.uID = TRAY_ID;
+        nid.uFlags = windows::Win32::UI::Shell::NIF_INFO;
+        nid.dwInfoFlags = flag;
+        let mut t = title.encode_utf16().collect::<Vec<u16>>();
+        t.push(0);
+        t.truncate(64);
+        for (i, c) in t.iter().enumerate() {
+            nid.szInfoTitle[i] = *c;
+        }
+        let mut txt = text.encode_utf16().collect::<Vec<u16>>();
+        txt.push(0);
+        txt.truncate(256);
+        for (i, c) in txt.iter().enumerate() {
+            nid.szInfo[i] = *c;
+        }
+        unsafe {
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
+    }
 }
