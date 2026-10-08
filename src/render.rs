@@ -221,6 +221,84 @@ pub unsafe fn draw_text_line(hdc: HDC, text: &mut [u16], rc: *mut windows::Win32
 pub const DT_VCENTER_FLAG: DRAW_TEXT_FORMAT = DT_VCENTER;
 pub const DT_WORDBREAK_FLAG: DRAW_TEXT_FORMAT = DT_WORDBREAK;
 
+/// 原版 BatteryBar 拟物玻璃分层高光（Gloss Split）电池条绘制器
+pub unsafe fn draw_glass_battery_bar(
+    hdc: HDC,
+    l: i32,
+    t: i32,
+    r: i32,
+    b: i32,
+    pct: i32,
+    charging: bool,
+    low: bool,
+    critical: bool,
+    dark_mode: bool,
+) {
+    use windows::Win32::Graphics::Gdi::{
+        CreatePen, GetStockObject, LineTo, MoveToEx, RoundRect, SelectObject, HGDIOBJ, NULL_PEN,
+        PS_SOLID,
+    };
+
+    let w = r - l;
+    let h = b - t;
+    if w <= 10 || h <= 8 {
+        return;
+    }
+
+    let radius = 4i32;
+
+    // 1. 凹槽底座（Track）：未填充区域
+    let track_bg_top = if dark_mode { rgb(38, 46, 54) } else { rgb(230, 235, 240) };
+    let track_bg_bot = if dark_mode { rgb(24, 30, 36) } else { rgb(212, 218, 224) };
+    let split_h = t + (h * 45) / 100;
+
+    fill_round(hdc, l, t, r, b, radius, track_bg_bot);
+    fill_round(hdc, l + 1, t + 1, r - 1, split_h, radius.max(2), track_bg_top);
+
+    // 2. 电量填充条（Progress Fill）
+    let valid_pct = if pct < 0 { 0 } else { pct.clamp(0, 100) };
+    let inner_w = (w - 2) as i64;
+    let fw = (inner_w * valid_pct as i64 / 100) as i32;
+
+    if fw > 2 {
+        let fl = l + 1;
+        let fr = fl + fw;
+        let (gloss_top, gloss_bot, gloss_line) = if charging {
+            // 充电：晶莹翠绿 / 浓郁深翠绿 / 晶莹分割线
+            (rgb(136, 226, 120), rgb(46, 160, 56), rgb(180, 245, 165))
+        } else if critical {
+            // 临界低电：珊瑚亮红 / 深警示红
+            (rgb(255, 120, 110), rgb(200, 35, 35), rgb(255, 175, 170))
+        } else if low {
+            // 低电：透亮金橙 / 浓琥珀橙
+            (rgb(255, 204, 80), rgb(230, 130, 15), rgb(255, 230, 140))
+        } else {
+            // 正常放电：清澈通透翠绿（原版默认）/ 浓郁深翠绿
+            (rgb(125, 220, 115), rgb(42, 155, 52), rgb(170, 242, 155))
+        };
+
+        fill_round(hdc, fl, t + 1, fr, b - 1, radius.max(2), gloss_bot);
+        fill_round(hdc, fl, t + 1, fr, split_h, radius.max(2), gloss_top);
+
+        let pen_gloss = CreatePen(PS_SOLID, 1, gloss_line);
+        let old_p = SelectObject(hdc, pen_gloss.into());
+        let _ = MoveToEx(hdc, fl + 1, split_h, None);
+        let _ = LineTo(hdc, fr - 1, split_h);
+        SelectObject(hdc, old_p);
+        let _ = DeleteObject(HGDIOBJ(pen_gloss.0));
+    }
+
+    // 3. 原版精致微质感外边框
+    let border_color = if dark_mode { rgb(55, 66, 78) } else { rgb(185, 195, 205) };
+    let pen_border = CreatePen(PS_SOLID, 1, border_color);
+    let old_pen = SelectObject(hdc, pen_border.into());
+    let old_brush = SelectObject(hdc, GetStockObject(NULL_PEN));
+    let _ = RoundRect(hdc, l, t, r, b, radius * 2, radius * 2);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(HGDIOBJ(pen_border.0));
+}
+
 #[allow(unused)]
 fn _use(b: HBRUSH) -> HBRUSH {
     b

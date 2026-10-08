@@ -226,8 +226,8 @@ fn relayout(bar: HWND) {
         let tb_w = trc.right - trc.left;
         let tb_h = trc.bottom - trc.top;
         if tb_h > tb_w {
-            // 竖排任务栏：宽度填满任务栏宽度，高度为优雅的 38px 卡片，位于托盘上方
-            let bar_h = 38i32;
+            // 竖排任务栏：宽度填满任务栏宽度，高度为 30px 紧凑精致卡片，位于托盘上方
+            let bar_h = 30i32;
             let (y, _unused) = taskbar::tray_left_estimate(parent);
             let _ = taskbar::place(bar, 0, y - bar_h - 4, tb_w, bar_h);
         } else {
@@ -338,6 +338,14 @@ unsafe extern "system" fn bar_wndproc(
             let _ = PostQuitMessage(0);
             LRESULT(0)
         }
+        WAM::WM_COMMAND => {
+            let host_val = TRAY_HWND.load(Ordering::Relaxed);
+            if host_val != 0 {
+                let host = HWND(host_val as *mut _);
+                unsafe { let _ = WAM::PostMessageW(Some(host), WAM::WM_COMMAND, wparam, lparam); }
+            }
+            LRESULT(0)
+        }
         _ => {
             let reg = REFRESH_MSG.load(Ordering::Relaxed);
             if reg != 0 && msg == reg {
@@ -354,25 +362,27 @@ fn show_bar_menu(hwnd: HWND) {
         if let Ok(menu) = CreatePopupMenu() {
             let cur = mode_now();
             let mark = |on: bool| -> MENU_ITEM_FLAGS {
-                if on { MENU_ITEM_FLAGS(0x8 | 0x1) /* MF_CHECKED | MF_STRING */ } else { MENU_ITEM_FLAGS(0x1) }
+                if on { MENU_ITEM_FLAGS(0x00000008) /* MF_CHECKED */ } else { MENU_ITEM_FLAGS(0) /* MF_STRING | MF_ENABLED */ }
             };
             let _ = AppendMenuW(menu, mark(cur == DisplayMode::TimeRemaining), ID_MENU_MODE_TIME, w!("显示时间剩余"));
             let _ = AppendMenuW(menu, mark(cur == DisplayMode::Percent), ID_MENU_MODE_PCT, w!("显示百分比"));
             let _ = AppendMenuW(menu, mark(cur == DisplayMode::Icon), ID_MENU_MODE_ICON, w!("只显示图标"));
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x800) /* MF_SEPARATOR */, 0, PCWSTR::null());
-            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x1), ID_MENU_PREFS, w!("Preferences..."));
-            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x1), ID_MENU_TOGGLE, w!("显示/隐藏条"));
-            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x1), ID_MENU_EXIT, w!("退出"));
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_PREFS, w!("Preferences..."));
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_TOGGLE, w!("显示/隐藏条"));
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_EXIT, w!("退出"));
             let mut pt = POINT::default();
             let _ = WAM::GetCursorPos(&mut pt);
-            SetForegroundWindow(hwnd);
+            let host_val = TRAY_HWND.load(Ordering::Relaxed);
+            let target = if host_val != 0 { HWND(host_val as *mut _) } else { hwnd };
+            SetForegroundWindow(target);
             let _ = TrackPopupMenu(
                 menu,
                 TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
                 pt.x,
                 pt.y,
                 None,
-                hwnd,
+                target,
                 None,
             );
             let _ = DestroyMenu(menu);
@@ -563,37 +573,23 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         return;
     }
 
-    // 1. 底槽（Track / Background）
-    let track_bg = if dark { render::rgb(36, 44, 52) } else { render::rgb(225, 230, 236) };
-    render::fill_round(hdc, card_l, card_t, card_r, card_b, 5, track_bg);
+    // 1. 拟物玻璃分层高光电池条（完全复刻原版经典 Aero Glass 质感）
+    let low = pct <= c.low_percent;
+    let critical = pct <= c.critical_percent;
+    render::draw_glass_battery_bar(
+        hdc,
+        card_l,
+        card_t,
+        card_r,
+        card_b,
+        pct,
+        charging,
+        low,
+        critical,
+        dark,
+    );
 
-    // 2. 状态配色与进度填充
-    let fill = if charging {
-        render::rgb(76, 175, 80) // 经典饱满翠绿 (Charging)
-    } else if pct <= c.critical_percent {
-        render::rgb(244, 67, 54) // 警示红 (Critical)
-    } else if pct <= c.low_percent {
-        render::rgb(255, 152, 0) // 琥珀金/橙 (Low)
-    } else {
-        render::rgb(41, 182, 246) // 经典清爽天蓝 (Discharging)
-    };
-
-    let card_w = (card_r - card_l) as i64;
-    let valid_pct = if pct < 0 { 0 } else { pct.clamp(0, 100) };
-    let fill_w = (card_w * valid_pct as i64 / 100) as i32;
-    if fill_w > 4 {
-        render::fill_round(hdc, card_l, card_t, card_l + fill_w, card_b, 5, fill);
-    }
-
-    // 3. 边框线（微质感轮廓）
-    let border_color = if dark { render::rgb(56, 68, 80) } else { render::rgb(195, 205, 215) };
-    let pen = CreatePen(PS_SOLID, 1, border_color);
-    let old_pen = SelectObject(hdc, pen.into());
-    let _ = WAM_StrokeRect(hdc, card_l, card_t, card_r, card_b);
-    SelectObject(hdc, old_pen);
-    let _ = DeleteObject(pen.into());
-
-    // 4. 文字内容构建
+    // 2. 文字内容构建（大号加粗立体浮雕字，水平绝对居中）
     let eta = power::ETA_SECONDS.load(Ordering::Relaxed);
     let show_time = c.default_mode == DisplayMode::TimeRemaining;
 
@@ -662,7 +658,7 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         let icon_h = 13i32;
         let ix = (card_l + card_r) / 2 - icon_w / 2;
         let iy = (card_t + card_b) / 2 - icon_h / 2;
-        draw_battery_icon(hdc, ix, iy, icon_w, icon_h, pct, charging, fill, &pal);
+        draw_battery_icon(hdc, ix, iy, icon_w, icon_h, pct, charging, render::rgb(76, 175, 80), &pal);
     }
 }
 
