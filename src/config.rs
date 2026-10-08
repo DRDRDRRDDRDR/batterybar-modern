@@ -29,6 +29,12 @@ pub struct Config {
     pub notify_low: bool,
     pub notify_critical: bool,
     pub notify_full: bool,
+    pub play_sound: bool, // 警报播放提示音
+
+    // ---- Tools & Profiles ----
+    pub show_rate_in_tooltip: bool, // 悬停显示 mW 功耗
+    pub learn_profiles: bool, // 电池全寿命学习预测
+    pub battery_style: u32, // 0=经典拟物 Aero Glass, 1=现代 Fluent
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +61,10 @@ impl Default for Config {
             notify_low: true,
             notify_critical: true,
             notify_full: true,
+            play_sound: true,
+            show_rate_in_tooltip: true,
+            learn_profiles: true,
+            battery_style: 0,
         }
     }
 }
@@ -98,6 +108,10 @@ impl Config {
                 "notify_low" => c.notify_low = v == "true",
                 "notify_critical" => c.notify_critical = v == "true",
                 "notify_full" => c.notify_full = v == "true",
+                "play_sound" => c.play_sound = v == "true",
+                "show_rate_in_tooltip" => c.show_rate_in_tooltip = v == "true",
+                "learn_profiles" => c.learn_profiles = v == "true",
+                "battery_style" => c.battery_style = v.parse().unwrap_or(0),
                 _ => {}
             }
         }
@@ -115,7 +129,7 @@ impl Config {
             DisplayMode::Icon => "icon",
         };
         let text = format!(
-            "{{\n  \"show_tooltip\": {},\n  \"hide_when_full\": {},\n  \"run_at_startup\": {},\n  \"default_mode\": \"{}\",\n  \"alternate_on_click\": {},\n  \"only_percent_when_charging\": {},\n  \"bar_width\": {},\n  \"low_percent\": {},\n  \"critical_percent\": {},\n  \"notify_low\": {},\n  \"notify_critical\": {},\n  \"notify_full\": {}\n}}\n",
+            "{{\n  \"show_tooltip\": {},\n  \"hide_when_full\": {},\n  \"run_at_startup\": {},\n  \"default_mode\": \"{}\",\n  \"alternate_on_click\": {},\n  \"only_percent_when_charging\": {},\n  \"bar_width\": {},\n  \"low_percent\": {},\n  \"critical_percent\": {},\n  \"notify_low\": {},\n  \"notify_critical\": {},\n  \"notify_full\": {},\n  \"play_sound\": {},\n  \"show_rate_in_tooltip\": {},\n  \"learn_profiles\": {},\n  \"battery_style\": {}\n}}\n",
             self.show_tooltip,
             self.hide_when_full,
             self.run_at_startup,
@@ -128,6 +142,10 @@ impl Config {
             self.notify_low,
             self.notify_critical,
             self.notify_full,
+            self.play_sound,
+            self.show_rate_in_tooltip,
+            self.learn_profiles,
+            self.battery_style,
         );
         let _ = std::fs::write(config_path(), text);
     }

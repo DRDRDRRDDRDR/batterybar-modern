@@ -102,7 +102,7 @@ fn main() -> windows_core::Result<()> {
     // 注册条窗口类
     let bar_class = w!("BBM_Bar");
     let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
+        style: CS_HREDRAW | CS_VREDRAW | WAM::CS_DBLCLKS,
         lpfnWndProc: Some(bar_wndproc),
         hInstance: hinstance.into(),
         lpszClassName: PCWSTR::from_raw(bar_class.as_ptr()),
@@ -333,17 +333,18 @@ unsafe extern "system" fn bar_wndproc(
             }
             LRESULT(0)
         }
+        WAM::WM_LBUTTONDBLCLK => {
+            // 双击电池条直接打开 Preferences 设置面板
+            prefs::toggle_prefs();
+            LRESULT(0)
+        }
         WAM::WM_DESTROY => {
             let _ = KillTimer(Some(hwnd), TIMER_REFRESH);
             let _ = PostQuitMessage(0);
             LRESULT(0)
         }
         WAM::WM_COMMAND => {
-            let host_val = TRAY_HWND.load(Ordering::Relaxed);
-            if host_val != 0 {
-                let host = HWND(host_val as *mut _);
-                unsafe { let _ = WAM::PostMessageW(Some(host), WAM::WM_COMMAND, wparam, lparam); }
-            }
+            handle_menu_cmd(hwnd, (wparam.0 & 0xFFFF) as usize);
             LRESULT(0)
         }
         _ => {
@@ -373,20 +374,55 @@ fn show_bar_menu(hwnd: HWND) {
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_EXIT, w!("退出"));
             let mut pt = POINT::default();
             let _ = WAM::GetCursorPos(&mut pt);
-            let host_val = TRAY_HWND.load(Ordering::Relaxed);
-            let target = if host_val != 0 { HWND(host_val as *mut _) } else { hwnd };
-            SetForegroundWindow(target);
-            let _ = TrackPopupMenu(
+            SetForegroundWindow(hwnd);
+            let cmd = TrackPopupMenu(
                 menu,
-                TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
+                TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | WAM::TPM_RETURNCMD,
                 pt.x,
                 pt.y,
                 None,
-                target,
+                hwnd,
                 None,
             );
             let _ = DestroyMenu(menu);
+            if cmd.0 != 0 {
+                handle_menu_cmd(hwnd, cmd.0 as usize);
+            }
         }
+    }
+}
+
+fn handle_menu_cmd(hwnd: HWND, cmd: usize) {
+    match cmd {
+        ID_MENU_EXIT => {
+            unsafe { let _ = PostQuitMessage(0); }
+        }
+        ID_MENU_PREFS => {
+            prefs::toggle_prefs();
+        }
+        ID_MENU_MODE_TIME => {
+            set_mode(DisplayMode::TimeRemaining);
+            save_mode();
+            unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
+        }
+        ID_MENU_MODE_PCT => {
+            set_mode(DisplayMode::Percent);
+            save_mode();
+            unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
+        }
+        ID_MENU_MODE_ICON => {
+            set_mode(DisplayMode::Icon);
+            save_mode();
+            unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
+        }
+        ID_MENU_TOGGLE => {
+            unsafe {
+                let vis = IsWindowVisible(hwnd).as_bool();
+                let show_cmd = if vis { SW_HIDE } else { SW_SHOW };
+                let _ = ShowWindow(hwnd, show_cmd);
+            }
+        }
+        _ => {}
     }
 }
 
