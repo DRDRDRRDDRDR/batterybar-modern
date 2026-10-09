@@ -26,7 +26,7 @@ use crate::render;
 
 const POPUP_W: i32 = 320;
 const ROW_H: i32 = 24;
-const POPUP_H: i32 = 44 + ROW_H * 8 + 14;
+const POPUP_H: i32 = 44 + ROW_H * 9 + 14;
 const TIMER_ID: usize = 42;
 
 struct Popup {
@@ -181,6 +181,24 @@ unsafe extern "system" fn popup_wndproc(
     }
 }
 
+fn get_active_power_scheme() -> String {
+    let out = std::process::Command::new("powercfg")
+        .arg("/getactivescheme")
+        .output();
+    if let Ok(o) = out {
+        let s = String::from_utf8_lossy(&o.stdout);
+        if s.contains("381b4222") { return "平衡 (Balanced)".to_string(); }
+        if s.contains("a1841308") { return "节能 (Power Saver)".to_string(); }
+        if s.contains("8c5e7fda") { return "高性能 (High Performance)".to_string(); }
+        if let Some(pos) = s.find('(') {
+            if let Some(end) = s.find(')') {
+                return s[pos+1..end].trim().to_string();
+            }
+        }
+    }
+    "平衡 (Balanced)".to_string()
+}
+
 struct Row {
     key: &'static str,
     val: String,
@@ -218,13 +236,14 @@ unsafe fn paint_popup(p: &Popup, hdc: HDC, rc: &RECT) {
 
     let rows = [
         Row { key: "电量", val: if pct < 0 { "—".into() } else { format!("{}%", pct) }, color: Some(state_color) },
-        Row { key: "剩余时间", val: if charging { fmt_hms(eta) .replace("—", "充电中") } else { fmt_hms(eta) }, color: None },
+        Row { key: "剩余时间", val: if charging { if pct >= 100 { "已充满".into() } else if eta > 0 { fmt_hms(eta) } else { "充电中".into() } } else { fmt_hms(eta) }, color: None },
         Row { key: "容量", val: if full > 0 { format!("{} / {} mWh", rem, full) } else { "—".into() }, color: None },
         Row { key: if charging { "充电速率" } else { "放电速率" }, val: format!("{} mW", rate), color: None },
-        Row { key: "电池状态", val: if charging { "充电中 ⚡".into() } else if pct >= 100 { "已充满".into() } else { "使用电池".into() }, color: None },
+        Row { key: "电池状态", val: if charging { if pct >= 100 { "已充满 ⚡".into() } else { "充电中 ⚡".into() } } else { "使用电池".into() }, color: None },
         Row { key: "满电可用", val: fmt_hms(full_life), color: None },
         Row { key: "电源", val: if charging { "A/C 已接通".into() } else { "使用电池".into() }, color: None },
         Row { key: "电池损耗", val: if health > 0 { format!("{}%（健康 {}%）", 100 - health, health) } else { "—".into() }, color: None },
+        Row { key: "电源计划", val: get_active_power_scheme(), color: None },
     ];
 
     // 标题

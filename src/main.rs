@@ -55,7 +55,14 @@ const TRAY_POLL_MS: u32 = 30_000;
 // 菜单 ID
 const ID_MENU_MODE_TIME: usize = 0x1010;
 const ID_MENU_MODE_PCT: usize = 0x1011;
+const ID_MENU_MODE_RATE: usize = 0x1016;
+const ID_MENU_MODE_CAP: usize = 0x1017;
 const ID_MENU_MODE_ICON: usize = 0x1012;
+
+const ID_MENU_SCHEME_BALANCED: usize = 0x1020;
+const ID_MENU_SCHEME_SAVER: usize = 0x1021;
+const ID_MENU_SCHEME_PERF: usize = 0x1022;
+
 const ID_MENU_PREFS: usize = 0x1013;
 const ID_MENU_TOGGLE: usize = 0x1014;
 const ID_MENU_EXIT: usize = 0x1015;
@@ -65,7 +72,7 @@ static BAR_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize
 static TRAY_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 static REFRESH_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static LAST_SIG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
-static DISPLAY_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // 0=time 1=percent 2=icon
+static DISPLAY_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // 0=time 1=percent 2=rate 3=capacity 4=icon
 static HOVER_TRACKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 static CONFIG: OnceLock<Mutex<Config>> = OnceLock::new();
@@ -78,14 +85,18 @@ pub fn set_mode(m: DisplayMode) {
     DISPLAY_MODE.store(match m {
         DisplayMode::TimeRemaining => 0,
         DisplayMode::Percent => 1,
-        DisplayMode::Icon => 2,
+        DisplayMode::DischargeRate => 2,
+        DisplayMode::Capacity => 3,
+        DisplayMode::Icon => 4,
     }, Ordering::Relaxed);
 }
 
 fn mode_now() -> DisplayMode {
     match DISPLAY_MODE.load(Ordering::Relaxed) {
         1 => DisplayMode::Percent,
-        2 => DisplayMode::Icon,
+        2 => DisplayMode::DischargeRate,
+        3 => DisplayMode::Capacity,
+        4 => DisplayMode::Icon,
         _ => DisplayMode::TimeRemaining,
     }
 }
@@ -259,17 +270,21 @@ unsafe extern "system" fn bar_wndproc(
             LRESULT(0)
         }
         WAM::WM_LBUTTONUP => {
-            // 原版行为：点击切换 时间/百分比 显示
+            // 原版行为：点击在 时间剩余 / 百分比 / 功率速率 / 剩余容量 之间顺畅循环切换
             let cfg = config_lock();
-            let (alt, cur) = {
+            let alt = {
                 let c = cfg.lock().unwrap();
-                (c.alternate_on_click, mode_now())
+                c.alternate_on_click
             };
             if alt {
-                set_mode(match cur {
-                    DisplayMode::Percent => DisplayMode::TimeRemaining,
-                    _ => DisplayMode::Percent,
-                });
+                let next = match mode_now() {
+                    DisplayMode::TimeRemaining => DisplayMode::Percent,
+                    DisplayMode::Percent => DisplayMode::DischargeRate,
+                    DisplayMode::DischargeRate => DisplayMode::Capacity,
+                    _ => DisplayMode::TimeRemaining,
+                };
+                set_mode(next);
+                save_mode();
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             LRESULT(0)
@@ -358,6 +373,30 @@ unsafe extern "system" fn bar_wndproc(
     }
 }
 
+fn get_active_power_scheme() -> String {
+    let out = std::process::Command::new("powercfg")
+        .arg("/getactivescheme")
+        .output();
+    if let Ok(o) = out {
+        let s = String::from_utf8_lossy(&o.stdout);
+        if s.contains("381b4222") { return "平衡 (Balanced)".to_string(); }
+        if s.contains("a1841308") { return "节能 (Power Saver)".to_string(); }
+        if s.contains("8c5e7fda") { return "高性能 (High Performance)".to_string(); }
+        if let Some(pos) = s.find('(') {
+            if let Some(end) = s.find(')') {
+                return s[pos+1..end].trim().to_string();
+            }
+        }
+    }
+    "平衡 (Balanced)".to_string()
+}
+
+fn set_active_power_scheme(guid: &str) {
+    let _ = std::process::Command::new("powercfg")
+        .args(&["/setactive", guid])
+        .output();
+}
+
 fn show_bar_menu(hwnd: HWND) {
     unsafe {
         if let Ok(menu) = CreatePopupMenu() {
@@ -365,13 +404,27 @@ fn show_bar_menu(hwnd: HWND) {
             let mark = |on: bool| -> MENU_ITEM_FLAGS {
                 if on { MENU_ITEM_FLAGS(0x00000008) /* MF_CHECKED */ } else { MENU_ITEM_FLAGS(0) /* MF_STRING | MF_ENABLED */ }
             };
-            let _ = AppendMenuW(menu, mark(cur == DisplayMode::TimeRemaining), ID_MENU_MODE_TIME, w!("显示时间剩余"));
-            let _ = AppendMenuW(menu, mark(cur == DisplayMode::Percent), ID_MENU_MODE_PCT, w!("显示百分比"));
-            let _ = AppendMenuW(menu, mark(cur == DisplayMode::Icon), ID_MENU_MODE_ICON, w!("只显示图标"));
+
+            // 1. 原版 Pro 核心：Windows 电源方案一键切换 (Power Scheme Switcher)
+            let scheme = get_active_power_scheme();
+            let _ = AppendMenuW(menu, mark(scheme.contains("平衡") || scheme.contains("Balanced")), ID_MENU_SCHEME_BALANCED, w!("电源计划: 平衡 (Balanced)"));
+            let _ = AppendMenuW(menu, mark(scheme.contains("节能") || scheme.contains("Saver")), ID_MENU_SCHEME_SAVER, w!("电源计划: 节能 (Power Saver)"));
+            let _ = AppendMenuW(menu, mark(scheme.contains("高性能") || scheme.contains("Performance")), ID_MENU_SCHEME_PERF, w!("电源计划: 高性能 (High Performance)"));
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x800) /* MF_SEPARATOR */, 0, PCWSTR::null());
+
+            // 2. 原版多模式切换单选组 (Toolbar Display Items)
+            let _ = AppendMenuW(menu, mark(cur == DisplayMode::TimeRemaining), ID_MENU_MODE_TIME, w!("显示时间剩余 (Time Remaining)"));
+            let _ = AppendMenuW(menu, mark(cur == DisplayMode::Percent), ID_MENU_MODE_PCT, w!("显示电量百分比 (Percent Remaining)"));
+            let _ = AppendMenuW(menu, mark(cur == DisplayMode::DischargeRate), ID_MENU_MODE_RATE, w!("显示实时功率 (Discharge/Charge Rate)"));
+            let _ = AppendMenuW(menu, mark(cur == DisplayMode::Capacity), ID_MENU_MODE_CAP, w!("显示剩余容量 (Capacity Remaining)"));
+            let _ = AppendMenuW(menu, mark(cur == DisplayMode::Icon), ID_MENU_MODE_ICON, w!("只显示小图标 (Icon Only)"));
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x800) /* MF_SEPARATOR */, 0, PCWSTR::null());
+
+            // 3. 原版常规选项
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_PREFS, w!("Preferences..."));
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_TOGGLE, w!("显示/隐藏条"));
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_EXIT, w!("退出"));
+
             let mut pt = POINT::default();
             let _ = WAM::GetCursorPos(&mut pt);
             SetForegroundWindow(hwnd);
@@ -400,6 +453,18 @@ fn handle_menu_cmd(hwnd: HWND, cmd: usize) {
         ID_MENU_PREFS => {
             prefs::toggle_prefs();
         }
+        ID_MENU_SCHEME_BALANCED => {
+            set_active_power_scheme("381b4222-f694-41f0-9685-ff5bb260df2e");
+            unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
+        }
+        ID_MENU_SCHEME_SAVER => {
+            set_active_power_scheme("a1841308-3541-4fab-bc81-f71556f20b4a");
+            unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
+        }
+        ID_MENU_SCHEME_PERF => {
+            set_active_power_scheme("8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c");
+            unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
+        }
         ID_MENU_MODE_TIME => {
             set_mode(DisplayMode::TimeRemaining);
             save_mode();
@@ -407,6 +472,16 @@ fn handle_menu_cmd(hwnd: HWND, cmd: usize) {
         }
         ID_MENU_MODE_PCT => {
             set_mode(DisplayMode::Percent);
+            save_mode();
+            unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
+        }
+        ID_MENU_MODE_RATE => {
+            set_mode(DisplayMode::DischargeRate);
+            save_mode();
+            unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
+        }
+        ID_MENU_MODE_CAP => {
+            set_mode(DisplayMode::Capacity);
             save_mode();
             unsafe { let _ = InvalidateRect(Some(hwnd), None, false); }
         }
@@ -627,29 +702,55 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
 
     // 2. 文字内容构建（大号加粗立体浮雕字，水平绝对居中）
     let eta = power::ETA_SECONDS.load(Ordering::Relaxed);
-    let show_time = c.default_mode == DisplayMode::TimeRemaining;
+    let cur_mode = mode_now();
 
-    let text = if c.default_mode == DisplayMode::Icon {
+    let text = if cur_mode == DisplayMode::Icon {
         String::new()
     } else if pct < 0 {
         "—".to_string()
-    } else if show_time {
-        if charging {
-            if eta > 0 {
-                format!("⚡ {}:{:02}", eta / 3600, (eta % 3600) / 60)
-            } else {
-                format!("⚡ {}%", pct)
-            }
-        } else if eta > 0 {
-            format!("{}:{:02}", eta / 3600, (eta % 3600) / 60)
-        } else {
-            format!("{}%", pct)
-        }
     } else {
-        if charging {
-            format!("⚡ {}%", pct)
-        } else {
-            format!("{}%", pct)
+        match cur_mode {
+            DisplayMode::TimeRemaining => {
+                if charging {
+                    if pct >= 100 {
+                        "On A/C".to_string()
+                    } else if eta > 0 {
+                        format!("⚡ {}:{:02}", eta / 3600, (eta % 3600) / 60)
+                    } else {
+                        "⚡ 充电中".to_string()
+                    }
+                } else if eta > 0 {
+                    format!("{}:{:02}", eta / 3600, (eta % 3600) / 60)
+                } else {
+                    "放电中".to_string()
+                }
+            }
+            DisplayMode::Percent => {
+                if charging {
+                    format!("⚡ {}%", pct)
+                } else {
+                    format!("{}%", pct)
+                }
+            }
+            DisplayMode::DischargeRate => {
+                let mw = power::CHARGE_RATE_MW.load(Ordering::Relaxed);
+                if mw == 0 {
+                    "0.0 W".to_string()
+                } else if mw < 0 {
+                    format!("+{:.1}W", (-mw as f64) / 1000.0)
+                } else {
+                    format!("-{:.1}W", (mw as f64) / 1000.0)
+                }
+            }
+            DisplayMode::Capacity => {
+                let rem = power::REMAIN_MWH.load(Ordering::Relaxed);
+                if rem > 0 {
+                    format!("{:.1}Wh", (rem as f64) / 1000.0)
+                } else {
+                    format!("{}%", pct)
+                }
+            }
+            DisplayMode::Icon => String::new(),
         }
     };
 

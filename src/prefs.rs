@@ -255,7 +255,9 @@ unsafe fn handle_click(hwnd: HWND, click_y: i32) {
             "mode" => {
                 c.default_mode = match c.default_mode {
                     DisplayMode::TimeRemaining => DisplayMode::Percent,
-                    DisplayMode::Percent => DisplayMode::Icon,
+                    DisplayMode::Percent => DisplayMode::DischargeRate,
+                    DisplayMode::DischargeRate => DisplayMode::Capacity,
+                    DisplayMode::Capacity => DisplayMode::Icon,
                     DisplayMode::Icon => DisplayMode::TimeRemaining,
                 };
                 crate::set_mode(c.default_mode);
@@ -391,6 +393,8 @@ unsafe fn paint_prefs(p: &Prefs, hdc: HDC) {
                         "mode" => match c.default_mode {
                             DisplayMode::TimeRemaining => "时间剩余",
                             DisplayMode::Percent => "电量百分比",
+                            DisplayMode::DischargeRate => "实时功率 (W)",
+                            DisplayMode::Capacity => "剩余容量 (Wh)",
                             DisplayMode::Icon => "小图标模式",
                         },
                         "battery_style" => if c.battery_style == 0 { "经典 Aero Glass" } else { "现代 Fluent" },

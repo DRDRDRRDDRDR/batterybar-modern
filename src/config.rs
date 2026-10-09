@@ -41,7 +41,9 @@ pub struct Config {
 pub enum DisplayMode {
     TimeRemaining, // 原版默认
     Percent,
-    Icon, // 只显示小电池图标
+    DischargeRate, // 功耗/充电速率 (W / mW)
+    Capacity,      // 剩余容量 (Wh / mWh)
+    Icon,          // 只显示小电池图标
 }
 
 impl Default for Config {
@@ -96,6 +98,8 @@ impl Config {
                 "default_mode" => {
                     c.default_mode = match v {
                         "percent" => DisplayMode::Percent,
+                        "rate" => DisplayMode::DischargeRate,
+                        "capacity" => DisplayMode::Capacity,
                         "icon" => DisplayMode::Icon,
                         _ => DisplayMode::TimeRemaining,
                     }
@@ -126,6 +130,8 @@ impl Config {
         let mode = match self.default_mode {
             DisplayMode::TimeRemaining => "time",
             DisplayMode::Percent => "percent",
+            DisplayMode::DischargeRate => "rate",
+            DisplayMode::Capacity => "capacity",
             DisplayMode::Icon => "icon",
         };
         let text = format!(
