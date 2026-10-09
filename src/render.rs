@@ -162,8 +162,41 @@ pub unsafe fn stroke_round(
     let _ = DeleteObject(HGDIOBJ(pen.0));
 }
 
-/// Telegram Desktop 优雅药丸电量条渲染器（Smooth Floating Pill）
-pub unsafe fn draw_telegram_battery_pill(
+/// 颜色混合：t=0 返回 a，t=1 返回 b（按 RGB 线性插值）
+pub fn mix(a: COLORREF, b: COLORREF, t: f32) -> COLORREF {
+    let t = t.clamp(0.0, 1.0);
+    let ar = (a.0 & 0xFF) as f32;
+    let ag = ((a.0 >> 8) & 0xFF) as f32;
+    let ab = ((a.0 >> 16) & 0xFF) as f32;
+    let br = (b.0 & 0xFF) as f32;
+    let bg = ((b.0 >> 8) & 0xFF) as f32;
+    let bb = ((b.0 >> 16) & 0xFF) as f32;
+    let r = (ar + (br - ar) * t) as u32;
+    let g = (ag + (bg - ag) * t) as u32;
+    let bl = (ab + (bb - ab) * t) as u32;
+    COLORREF(r | (g << 8) | (bl << 16))
+}
+
+/// 提亮：朝白色混合
+pub fn lighten(c: COLORREF, amount: f32) -> COLORREF {
+    mix(c, COLORREF(0x00FF_FFFF), amount)
+}
+
+/// 压暗：朝黑色混合
+pub fn darken(c: COLORREF, amount: f32) -> COLORREF {
+    mix(c, COLORREF(0), amount)
+}
+
+/// 拟物化实体电池渲染器（Skeuomorphic Battery）
+///
+/// 物理层次自外向内：
+///   1. 金属外壳（圆角矩形，顶部受光亮边 + 底部暗边 → 圆柱受光错觉）
+///   2. 正极端子（右侧凸起小方块，独立受光/背光）
+///   3. 内凹观察窗（深色槽 + 上沿内阴影 + 下沿内高光 → 凹陷错觉）
+///   4. 电解液液面（双层高光：上层玻璃反光 / 下层液面本色 + 1px 液面镜面线）
+///   5. 玻璃罩反光带（横跨上部，模拟弧面玻璃的柔和高光）
+///   6. 外轮廓描边
+pub unsafe fn draw_skeuo_battery(
     hdc: HDC,
     l: i32,
     t: i32,
@@ -177,39 +210,141 @@ pub unsafe fn draw_telegram_battery_pill(
 ) {
     let w = r - l;
     let h = b - t;
-    if w <= 8 || h <= 6 {
+    if w <= 14 || h <= 8 {
         return;
     }
 
-    let radius = h / 2; // 纯圆弧平滑药丸胶囊
+    let radius = 3i32;
 
-    // 1. 底槽：Telegram 次级深色半透槽
-    fill_round(hdc, l, t, r, b, radius, pal.track);
+    // ---- 状态主色（Telegram 设计令牌体系内提亮，保证拟物通透感）----
+    let base = if charging {
+        pal.accent_blue
+    } else if critical {
+        pal.accent_crit
+    } else if low {
+        pal.accent_warn
+    } else {
+        pal.accent_green
+    };
 
-    // 2. 平滑流体进度填充（Fluid Progress）
-    let valid_pct = if pct < 0 { 0 } else { pct.clamp(0, 100) };
-    let inner_w = (w - 2) as i64;
-    let fw = (inner_w * valid_pct as i64 / 100) as i32;
-
-    if fw >= 4 {
-        let fl = l + 1;
-        let fr = fl + fw;
-        
-        let fill_color = if charging {
-            pal.accent_blue  // 优雅湛蓝 (Telegram Blue)
-        } else if critical {
-            pal.accent_crit  // 珊瑚红 (Warning Red)
-        } else if low {
-            pal.accent_warn  // 琥珀金 (Warning Amber)
-        } else {
-            pal.accent_green // 生机翠绿 (Telegram Green)
-        };
-
-        fill_round(hdc, fl, t + 1, fr, b - 1, radius.min(fw / 2), fill_color);
+    // ---- 几何：外壳主体 + 右侧正极端子 ----
+    let term_w = 4i32;
+    let term_h = (h * 46) / 100;
+    let term_t = t + (h - term_h) / 2;
+    let term_b = term_t + term_h;
+    let body_r = r - term_w - 1;
+    let body_w = body_r - l;
+    if body_w <= 6 {
+        return;
     }
 
-    // 3. Telegram 风格极其克制的 1px 微外边框
-    stroke_round(hdc, l, t, r, b, radius, pal.border);
+    // ---- 1. 金属外壳：竖向渐变（顶亮 → 底暗），圆柱金属质感 ----
+    let shell_top = lighten(pal.surface, 0.38);
+    let shell_bot = darken(pal.surface, 0.26);
+    fill_round(hdc, l, t, body_r, b, radius, shell_bot);
+    let shell_split = t + (h * 46) / 100;
+    fill_round(hdc, l, t, body_r, shell_split, radius, shell_top);
+
+    // ---- 2. 正极端子：整体亮于外壳的金属凸起（凸起感靠底部 1px 投影，不靠半边明暗）----
+    let term_l = body_r + 1;
+    fill_round(hdc, term_l, term_t, r, term_b, 1, lighten(pal.surface, 0.46));
+    let term_shadow = &RECT {
+        left: term_l,
+        top: term_b - 1,
+        right: r,
+        bottom: term_b,
+    };
+    fill_solid(hdc, term_shadow, darken(pal.surface, 0.30));
+
+    // ---- 3. 内凹观察窗（深色凹槽）----
+    let inset = 2i32;
+    let win_l = l + inset;
+    let win_t = t + inset;
+    let win_r = body_r - inset;
+    let win_b = b - inset;
+    let win_w = win_r - win_l;
+    let win_h = win_b - win_t;
+    if win_w <= 4 || win_h <= 3 {
+        return;
+    }
+    let win_radius = 2i32;
+    let well = darken(pal.surface_dim, 0.42);
+    fill_round(hdc, win_l, win_t, win_r, win_b, win_radius, well);
+
+    // ---- 4. 电解液液面（双层高光 + 1px 镜面线 + 镜面斑）----
+    let valid_pct = if pct < 0 { 0 } else { pct.clamp(0, 100) };
+    let fill_w = (win_w * valid_pct / 100) as i32;
+    if fill_w >= 2 {
+        let fl = win_l;
+        let fr = win_l + fill_w;
+        let fr_radius = win_radius.min(fill_w / 2);
+
+        // 下层：液面本色
+        fill_round(hdc, fl, win_t, fr, win_b, fr_radius, darken(base, 0.22));
+        // 上层：玻璃反光层（提亮幅度受控，避免洗成近白）
+        let fluid_split = win_t + (win_h * 42) / 100;
+        fill_round(hdc, fl, win_t, fr, fluid_split, fr_radius, lighten(base, 0.14));
+
+        // 1px 液面镜面线（分界高光细线 —— 拟物感的关键细节）
+        if fr - fl >= 4 && fluid_split > win_t {
+            let line = &RECT {
+                left: fl + 1,
+                top: fluid_split - 1,
+                right: fr - 1,
+                bottom: fluid_split,
+            };
+            fill_solid(hdc, line, lighten(base, 0.42));
+        }
+
+        // 镜面斑：液面上部左侧一小段柔光，宽度压到 22% 以内，避免读成划痕
+        if fill_w >= 16 && fluid_split - win_t >= 3 {
+            let streak_r = fl + 2 + (fill_w * 22) / 100;
+            let streak = &RECT {
+                left: fl + 2,
+                top: win_t + 1,
+                right: streak_r,
+                bottom: win_t + 2,
+            };
+            fill_solid(hdc, streak, lighten(base, 0.38));
+        }
+    }
+
+    // 上沿内阴影（凹陷错觉）：观察窗顶部 1px 深线
+    let shadow = &RECT {
+        left: win_l + 1,
+        top: win_t,
+        right: win_r - 1,
+        bottom: win_t + 1,
+    };
+    fill_solid(hdc, shadow, darken(well, 0.62));
+
+    // 下沿内高光（凹陷底部反光）：观察窗底部 1px 亮线
+    let inner_light = &RECT {
+        left: win_l + 1,
+        top: win_b - 1,
+        right: win_r - 1,
+        bottom: win_b,
+    };
+    fill_solid(hdc, inner_light, lighten(pal.surface, 0.16));
+
+    // ---- 5. 外框：顶部受光亮边收窄变柔 + 底部接地暗边 + 1px 深轮廓 ----
+    let top_edge = &RECT {
+        left: l + 3,
+        top: t,
+        right: body_r - 3,
+        bottom: t + 1,
+    };
+    fill_solid(hdc, top_edge, lighten(pal.surface, 0.34));
+
+    let bottom_edge = &RECT {
+        left: l + 2,
+        top: b - 1,
+        right: body_r - 2,
+        bottom: b,
+    };
+    fill_solid(hdc, bottom_edge, darken(pal.surface, 0.62));
+
+    stroke_round(hdc, l, t, body_r, b, radius, darken(pal.surface, 0.66));
 }
 
 /// 创建高质量 UI 字体：Segoe UI Variable Text / Segoe UI

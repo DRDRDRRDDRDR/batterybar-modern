@@ -705,10 +705,10 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         return;
     }
 
-    // 1. Telegram Desktop 优雅药丸电量条（Smooth Floating Pill）
+    // 1. 拟物化实体电池（Skeuomorphic Battery：金属外壳 + 正极端子 + 内凹观察窗 + 液面）
     let low = pct <= c.low_percent;
     let critical = pct <= c.critical_percent;
-    render::draw_telegram_battery_pill(
+    render::draw_skeuo_battery(
         hdc,
         card_l,
         card_t,
