@@ -139,6 +139,21 @@ fn main() -> windows_core::Result<()> {
         }
     }
 
+    // 注册 Preferences 设置窗口类（BBM_Prefs）
+    let prefs_class = w!("BBM_Prefs");
+    let wc3 = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW,
+        lpfnWndProc: Some(prefs::prefs_wndproc),
+        hInstance: hinstance.into(),
+        lpszClassName: PCWSTR::from_raw(prefs_class.as_ptr()),
+        ..Default::default()
+    };
+    unsafe {
+        if RegisterClassW(&wc3) == 0 {
+            return Err(windows_core::Error::from_thread());
+        }
+    }
+
     unsafe {
         // 1) 托盘宿主
         let msg_hwnd = CreateWindowExW(
@@ -212,7 +227,13 @@ fn main() -> windows_core::Result<()> {
         let _ = SetTimer(Some(bar_hwnd), TIMER_REFRESH, REFRESH_MS, None);
         let _ = SetTimer(Some(msg_hwnd), TRAY_TIMER, TRAY_POLL_MS, None);
 
-        // 7) 消息循环
+        // 7) 支持命令行直接打开设置面板
+        let args: Vec<String> = std::env::args().collect();
+        if args.iter().any(|a| a == "--prefs" || a == "-p") {
+            prefs::toggle_prefs();
+        }
+
+        // 8) 消息循环
         let mut msg = WAM::MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
@@ -684,10 +705,10 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         return;
     }
 
-    // 1. 拟物玻璃分层高光电池条（完全复刻原版经典 Aero Glass 质感）
+    // 1. Telegram Desktop 优雅药丸电量条（Smooth Floating Pill）
     let low = pct <= c.low_percent;
     let critical = pct <= c.critical_percent;
-    render::draw_glass_battery_bar(
+    render::draw_telegram_battery_pill(
         hdc,
         card_l,
         card_t,
@@ -697,7 +718,7 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         charging,
         low,
         critical,
-        dark,
+        &pal,
     );
 
     // 2. 文字内容构建（大号加粗立体浮雕字，水平绝对居中）
@@ -767,18 +788,8 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         let tx = cx - size.cx / 2;
         let ty = cy - size.cy / 2;
 
-        // 阴影字（下偏 1px，黑底半透立体效果）
-        SetTextColor(hdc, render::rgb(0, 0, 0));
-        let mut drc_shadow = RECT {
-            left: tx + 1,
-            top: ty + 1,
-            right: tx + size.cx + 2,
-            bottom: ty + size.cy + 2,
-        };
-        DrawTextW(hdc, &mut buf, &mut drc_shadow, DT_NOPREFIX | DT_SINGLELINE);
-
-        // 主字（纯白高亮）
-        SetTextColor(hdc, render::rgb(255, 255, 255));
+        // Telegram 单色高清晰字体排版（无杂色毛边）
+        SetTextColor(hdc, pal.text);
         let mut drc_text = RECT {
             left: tx,
             top: ty,
