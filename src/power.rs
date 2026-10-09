@@ -26,6 +26,8 @@ pub static AVAILABLE: AtomicBool = AtomicBool::new(false); // 本机有无电池
 pub static FULL_LIFETIME_SECONDS: AtomicU64 = AtomicU64::new(0); // 满充可用时长(学习值)
 pub static ELAPSED_ON_BATTERY: AtomicU64 = AtomicU64::new(0); // 本次用电池已时长
 pub static VOLTAGE_MV: AtomicI32 = AtomicI32::new(0); // 电压(mV)
+/// Win32 ACLineStatus: 1=接通外部电源，0=使用电池（255=未知）
+pub static AC_ON: AtomicBool = AtomicBool::new(true);
 
 // 通知状态沿（true = 该事件已触发过，状态切换后复位）
 pub static NOTIFY_LOW_LATCH: AtomicBool = AtomicBool::new(false);
@@ -242,8 +244,12 @@ pub fn sync_win32_power() {
             if sps.BatteryLifePercent != 255 {
                 PERCENT.store(sps.BatteryLifePercent as i32, Ordering::Relaxed);
             }
-            if sps.BatteryFlag != 128 {
+            if sps.BatteryFlag & 0x10 == 0 {
+                // 0x10 = no system battery
                 AVAILABLE.store(true, Ordering::Relaxed);
+            }
+            if sps.ACLineStatus != 255 {
+                AC_ON.store(sps.ACLineStatus == 1, Ordering::Relaxed);
             }
             if sps.ACLineStatus == 1 || (sps.BatteryFlag & 8) != 0 {
                 CHARGING.store(true, Ordering::Relaxed);

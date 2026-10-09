@@ -73,6 +73,17 @@ impl TrayIcon {
         }
     }
 
+    /// 播放系统提示音（低电/临界/自定义警报时用）
+    pub fn sound(&self) {
+        use windows::Win32::System::Diagnostics::Debug::MessageBeep;
+        use windows::Win32::UI::WindowsAndMessaging::{MB_ICONEXCLAMATION, MB_ICONWARNING};
+        // MB_ICONWARNING == MB_ICONEXCLAMATION == MESSAGEBOX_STYLE(0x30)；连响两声更像警报
+        unsafe {
+            let _ = MessageBeep(MB_ICONWARNING);
+            let _ = MessageBeep(MB_ICONEXCLAMATION);
+        }
+    }
+
     pub fn remove(&self) {
         let mut nid = NOTIFYICONDATAW::default();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;

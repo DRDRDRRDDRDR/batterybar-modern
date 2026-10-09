@@ -7,13 +7,12 @@
 // 5. 几何：连续平滑曲线药丸卡片 (Smooth Floating Pill)，摒弃粗陋切线与硬突起。
 #![allow(non_snake_case)]
 
-use windows::Win32::Foundation::{COLORREF, RECT};
+use windows::Win32::Foundation::{COLORREF, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, LineTo, MoveToEx,
-    RoundRect, SelectObject, SetBkMode, SetTextColor, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE,
-    DT_VCENTER, DT_WORDBREAK, DRAW_TEXT_FORMAT, FONT_CHARSET, FONT_CLIP_PRECISION,
-    FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, HFONT, HGDIOBJ, TRANSPARENT, PS_SOLID,
-    GetStockObject, HOLLOW_BRUSH, NULL_PEN,
+    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, FillRect, Polygon, RoundRect,
+    SelectObject, SetBkMode, SetTextColor, ANTIALIASED_QUALITY, DT_VCENTER, DT_WORDBREAK,
+    DRAW_TEXT_FORMAT, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC,
+    HFONT, HGDIOBJ, TRANSPARENT, PS_SOLID, GetStockObject, HOLLOW_BRUSH, NULL_PEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
@@ -118,6 +117,78 @@ pub unsafe fn fill_solid(hdc: HDC, rc: &RECT, color: COLORREF) {
     let _ = DeleteObject(HGDIOBJ(brush.0));
 }
 
+/// 半透明铺底：用 AlphaBlend 把纯色按 alpha 混到**已有目标像素**上。
+/// 用于「电池条背景不透明度」——alpha<100 时让 Windows 11 任务栏自身的
+/// Acrylic 亚克力层透上来。返回 false 表示「调用方应回落到 fill_solid」。
+///
+/// 关键点：子窗口（非 layered）BeginPaint 得到的 HDC 是被裁剪到本窗口区域的
+/// 显示 DC，AlphaBlend 读到的目标像素就是任务栏已画好的内容，所以混合有效。
+pub unsafe fn fill_solid_alpha(hdc: HDC, rc: &RECT, color: COLORREF, alpha_pct: i32) -> bool {
+    use windows::Win32::Graphics::Gdi::{
+        AlphaBlend, CreateCompatibleDC, CreateDIBSection, DeleteDC, AC_SRC_OVER, BI_RGB,
+        BITMAPINFO, BLENDFUNCTION, DIB_RGB_COLORS,
+    };
+
+    let w = rc.right - rc.left;
+    let h = rc.bottom - rc.top;
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    let pct = alpha_pct.clamp(0, 100);
+    if pct >= 100 {
+        return false; // 全不透明 → 走 fill_solid
+    }
+    let alpha = ((pct * 255) / 100) as u8;
+    if alpha == 0 {
+        return true; // 全透明 → 什么都不画，任务栏自己透出来
+    }
+
+    let mut bmi = BITMAPINFO::default();
+    bmi.bmiHeader.biSize = std::mem::size_of::<windows::Win32::Graphics::Gdi::BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; // 负高度 = top-down DIB
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB.0;
+
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let hbm = match CreateDIBSection(Some(hdc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+        Ok(h) => h,
+        Err(_) => return false,
+    };
+    let mem = CreateCompatibleDC(Some(hdc));
+    if bits.is_null() || mem.is_invalid() {
+        let _ = DeleteObject(hbm.into());
+        return false;
+    }
+    let old = SelectObject(mem, hbm.into());
+
+    // COLORREF = 0x00BBGGRR；DIB 像素布局 = 0xAARRGGBB
+    let r = (color.0 & 0xFF) as u8;
+    let g = ((color.0 >> 8) & 0xFF) as u8;
+    let b = ((color.0 >> 16) & 0xFF) as u8;
+    let px = bits as *mut u8;
+    for i in 0..(w as usize * h as usize) {
+        *px.add(i * 4) = b;
+        *px.add(i * 4 + 1) = g;
+        *px.add(i * 4 + 2) = r;
+        *px.add(i * 4 + 3) = 255;
+    }
+
+    let bf = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: alpha,
+        AlphaFormat: 0,
+    };
+    let ok = AlphaBlend(hdc, rc.left, rc.top, rc.right, rc.bottom, mem, 0, 0, w, h, bf).as_bool();
+
+    SelectObject(mem, old);
+    let _ = DeleteDC(mem);
+    let _ = DeleteObject(hbm.into());
+    ok
+}
+
 /// 连续平滑圆角块（选入 NULL_PEN，杜绝任何 GDI 黑色外轮廓）
 pub unsafe fn fill_round(
     hdc: HDC,
@@ -187,16 +258,19 @@ pub fn darken(c: COLORREF, amount: f32) -> COLORREF {
     mix(c, COLORREF(0), amount)
 }
 
-/// 拟物化实体电池渲染器（Skeuomorphic Battery）
+/// 拟物化电池图标（Skeuomorphic Battery Icon）
 ///
-/// 物理层次自外向内：
-///   1. 金属外壳（圆角矩形，顶部受光亮边 + 底部暗边 → 圆柱受光错觉）
-///   2. 正极端子（右侧凸起小方块，独立受光/背光）
-///   3. 内凹观察窗（深色槽 + 上沿内阴影 + 下沿内高光 → 凹陷错觉）
-///   4. 电解液液面（双层高光：上层玻璃反光 / 下层液面本色 + 1px 液面镜面线）
-///   5. 玻璃罩反光带（横跨上部，模拟弧面玻璃的柔和高光）
-///   6. 外轮廓描边
-pub unsafe fn draw_skeuo_battery(
+/// 与「进度条」的本质区别：电池有**固定壳体轮廓**和**正的端子**，
+/// 填充只是壳内的一部分，而不是整条被拉长。
+///
+/// 拟物感来自 5 件套（缺一件就塌成色块）：
+///   1. 连续剪影：先铺深色外形（壳体 ∪ 端子，两者重叠 1px），再整体内缩 1px 填金属
+///      —— 端子与壳体**共用一条外轮廓**，结构上不可能出现缝隙（原版就是被 1px 缝割裂的元凶）
+///   2. 金属渐变：6 段竖向色标（顶部受光 → 底部接地暗），模拟圆柱面漫反射
+///   3. 四向边缘光：上亮 / 左亮 / 下暗 / 右暗，让平面产生厚度
+///   4. 观察窗凹陷：井底近黑 + 上沿内阴影 + 下沿内反光
+///   5. 液面物理：底部深 → 液面浅 + 1px 弯月高光 + 左上柔光斑 + 底部反光暗带
+pub unsafe fn draw_battery_icon(
     hdc: HDC,
     l: i32,
     t: i32,
@@ -210,13 +284,11 @@ pub unsafe fn draw_skeuo_battery(
 ) {
     let w = r - l;
     let h = b - t;
-    if w <= 14 || h <= 8 {
+    if w < 10 || h < 6 {
         return;
     }
 
-    let radius = 3i32;
-
-    // ---- 状态主色（Telegram 设计令牌体系内提亮，保证拟物通透感）----
+    // ---- 状态主色 ----
     let base = if charging {
         pal.accent_blue
     } else if critical {
@@ -227,128 +299,236 @@ pub unsafe fn draw_skeuo_battery(
         pal.accent_green
     };
 
-    // ---- 几何：外壳主体 + 右侧正极端子 ----
-    let term_w = 4i32;
-    let term_h = (h * 46) / 100;
+    // 极小尺寸兜底：没有空间做拟物层次，只画一个带轮廓的色块
+    if h < 12 || w < 20 {
+        let radius = ((h as f32 * 0.30).round() as i32).max(1);
+        stroke_round(hdc, l, t, r, b, radius, rgb(14, 17, 22));
+        let pad = 2i32;
+        let fw = ((w - pad * 2) * pct.clamp(0, 100) / 100).max(1);
+        if fw > 1 {
+            fill_round(hdc, l + pad, t + pad, l + pad + fw, b - pad, radius - 1, base);
+        }
+        return;
+    }
+
+    // ---- 几何：壳体 + 正极端子 ----
+    let radius = ((h as f32 * 0.20).round() as i32).max(2);
+    let term_w = ((w as f32 * 0.115).round() as i32).max(2);
+    let term_h = ((h as f32 * 0.44).round() as i32).max(5);
     let term_t = t + (h - term_h) / 2;
     let term_b = term_t + term_h;
-    let body_r = r - term_w - 1;
-    let body_w = body_r - l;
-    if body_w <= 6 {
+    let body_r = r - term_w; // 壳体右缘与端子左缘重合，零缝隙
+    if body_r - l <= 8 {
         return;
     }
 
-    // ---- 1. 金属外壳：竖向渐变（顶亮 → 底暗），圆柱金属质感 ----
-    let shell_top = lighten(pal.surface, 0.38);
-    let shell_bot = darken(pal.surface, 0.26);
-    fill_round(hdc, l, t, body_r, b, radius, shell_bot);
-    let shell_split = t + (h * 46) / 100;
-    fill_round(hdc, l, t, body_r, shell_split, radius, shell_top);
+    // ---- 1. 连续深色剪影（壳体 ∪ 端子，端子左压 1px 压进壳体）----
+    let rim = rgb(13, 16, 21);
+    fill_round(hdc, body_r - 1, term_t, r, term_b, 1, rim);
+    fill_round(hdc, l, t, body_r, b, radius, rim);
 
-    // ---- 2. 正极端子：整体亮于外壳的金属凸起（凸起感靠底部 1px 投影，不靠半边明暗）----
-    let term_l = body_r + 1;
-    fill_round(hdc, term_l, term_t, r, term_b, 1, lighten(pal.surface, 0.46));
-    let term_shadow = &RECT {
-        left: term_l,
-        top: term_b - 1,
-        right: r,
-        bottom: term_b,
-    };
-    fill_solid(hdc, term_shadow, darken(pal.surface, 0.30));
+    // 金属内区（整体内缩 1px → 四周恒为 1px 深轮廓）
+    let il = l + 1;
+    let it = t + 1;
+    let ir = body_r - 1;
+    let ib = b - 1;
+    let ih = ib - it;
+    let rad = radius - 1;
 
-    // ---- 3. 内凹观察窗（深色凹槽）----
-    let inset = 2i32;
-    let win_l = l + inset;
-    let win_t = t + inset;
-    let win_r = body_r - inset;
-    let win_b = b - inset;
+    // ---- 2. 壳体金属：6 段竖向渐变（自底向上叠加，首尾两段提供圆角）----
+    let stops = [
+        rgb(190, 197, 209), // 0 顶面强受光
+        rgb(152, 160, 173),
+        rgb(114, 122, 136),
+        rgb(80, 87, 100),
+        rgb(51, 57, 68),
+        rgb(28, 32, 40), // 5 底面接地暗
+    ];
+    fill_round(hdc, il, it, ir, ib, rad, stops[5]);
+    for i in (0..5usize).rev() {
+        let y0 = it + (ih * i as i32) / 6;
+        let y1 = it + (ih * (i as i32 + 1)) / 6;
+        if i == 0 {
+            // 顶段用圆角矩形，向下多压 rad 保证顶角是圆的
+            fill_round(hdc, il, y0, ir, (y1 + rad).min(ib), rad, stops[0]);
+        } else {
+            fill_solid(
+                hdc,
+                &RECT { left: il, top: y0, right: ir, bottom: y1.min(ib) },
+                stops[i],
+            );
+        }
+    }
+
+    // ---- 3. 四向边缘光：制造厚度 ----
+    fill_solid(
+        hdc,
+        &RECT { left: il + rad, top: it, right: ir - rad, bottom: it + 1 },
+        rgb(232, 238, 247), // 顶：镜面高光
+    );
+    fill_solid(
+        hdc,
+        &RECT { left: il, top: it + rad, right: il + 1, bottom: ib - rad },
+        rgb(203, 210, 221), // 左：受光面
+    );
+    fill_solid(
+        hdc,
+        &RECT { left: il + rad, top: ib - 1, right: ir - rad, bottom: ib },
+        rgb(16, 19, 25), // 下：接地暗
+    );
+    fill_solid(
+        hdc,
+        &RECT { left: ir - 1, top: it + rad, right: ir, bottom: ib - rad },
+        rgb(30, 34, 42), // 右：背光面
+    );
+
+    // ---- 4. 正极端子：同族金属小柱，左缘直接压在壳体上（无缝）----
+    let tl = body_r - 1;
+    let tt = term_t + 1;
+    let tr = r - 1;
+    let tb = term_b - 1;
+    let th = tb - tt;
+    fill_round(hdc, tl, tt, tr, tb, 1, rgb(62, 69, 80));
+    fill_solid(hdc, &RECT { left: tl, top: tt + (th * 2) / 3, right: tr, bottom: tb }, rgb(116, 124, 137));
+    fill_solid(hdc, &RECT { left: tl, top: tt, right: tr, bottom: tt + th / 3 }, rgb(170, 178, 191));
+    fill_solid(hdc, &RECT { left: tl + 1, top: tt, right: tr, bottom: tt + 1 }, rgb(216, 223, 234));
+    fill_solid(hdc, &RECT { left: tl, top: tb - 1, right: tr, bottom: tb }, rgb(20, 24, 30));
+
+    // ---- 5. 观察窗（凹陷）----
+    let inset_x = ((h as f32 * 0.17).round() as i32).max(2);
+    let inset_y = ((h as f32 * 0.20).round() as i32).max(2);
+    let win_l = il + inset_x;
+    let win_t = it + inset_y;
+    let win_r = ir - inset_x;
+    let win_b = ib - inset_y;
     let win_w = win_r - win_l;
     let win_h = win_b - win_t;
-    if win_w <= 4 || win_h <= 3 {
+    if win_w < 4 || win_h < 3 {
         return;
     }
-    let win_radius = 2i32;
-    let well = darken(pal.surface_dim, 0.42);
-    fill_round(hdc, win_l, win_t, win_r, win_b, win_radius, well);
+    let wr = ((win_h as f32 * 0.18).round() as i32).max(1);
+    fill_round(hdc, win_l, win_t, win_r, win_b, wr, rgb(19, 22, 27));
+    fill_solid(hdc, &RECT { left: win_l + 1, top: win_t, right: win_r - 1, bottom: win_t + 1 }, rgb(6, 7, 10));
+    fill_solid(hdc, &RECT { left: win_l, top: win_t + 1, right: win_l + 1, bottom: win_b - 1 }, rgb(10, 12, 15));
+    fill_solid(hdc, &RECT { left: win_l + 1, top: win_b - 1, right: win_r - 1, bottom: win_b }, rgb(99, 106, 118));
+    fill_solid(hdc, &RECT { left: win_r - 1, top: win_t + 1, right: win_r, bottom: win_b - 1 }, rgb(74, 81, 93));
 
-    // ---- 4. 电解液液面（双层高光 + 1px 镜面线 + 镜面斑）----
-    let valid_pct = if pct < 0 { 0 } else { pct.clamp(0, 100) };
-    let fill_w = (win_w * valid_pct / 100) as i32;
-    if fill_w >= 2 {
-        let fl = win_l;
-        let fr = win_l + fill_w;
-        let fr_radius = win_radius.min(fill_w / 2);
+    // ---- 6. 电解液 ----
+    let liq_h = (win_h * pct.clamp(0, 100) / 100) as i32;
+    if liq_h >= 2 {
+        let fl = win_l + 1;
+        let fr = win_r - 1;
+        let fb = win_b - 1;
+        let ft = fb - liq_h;
+        let fr_rad = wr.min(liq_h / 2);
 
-        // 下层：液面本色
-        fill_round(hdc, fl, win_t, fr, win_b, fr_radius, darken(base, 0.22));
-        // 上层：玻璃反光层（提亮幅度受控，避免洗成近白）
-        let fluid_split = win_t + (win_h * 42) / 100;
-        fill_round(hdc, fl, win_t, fr, fluid_split, fr_radius, lighten(base, 0.14));
-
-        // 1px 液面镜面线（分界高光细线 —— 拟物感的关键细节）
-        if fr - fl >= 4 && fluid_split > win_t {
-            let line = &RECT {
-                left: fl + 1,
-                top: fluid_split - 1,
-                right: fr - 1,
-                bottom: fluid_split,
-            };
-            fill_solid(hdc, line, lighten(base, 0.42));
+        // 液柱本体：底部深（液体厚）→ 上部本色
+        fill_round(hdc, fl, ft, fr, fb, fr_rad, darken(base, 0.12));
+        let split = ft + (liq_h * 38) / 100;
+        if split > ft {
+            fill_round(hdc, fl, ft, fr, split + fr_rad, fr_rad, base);
         }
 
-        // 镜面斑：液面上部左侧一小段柔光，宽度压到 22% 以内，避免读成划痕
-        if fill_w >= 16 && fluid_split - win_t >= 3 {
-            let streak_r = fl + 2 + (fill_w * 22) / 100;
-            let streak = &RECT {
-                left: fl + 2,
-                top: win_t + 1,
-                right: streak_r,
-                bottom: win_t + 2,
-            };
-            fill_solid(hdc, streak, lighten(base, 0.38));
+        // 1px 弯月高光：液面与空气的界面反射（拟物的灵魂细节）
+        if fr - fl >= 3 {
+            fill_solid(
+                hdc,
+                &RECT { left: fl + 1, top: ft, right: fr - 1, bottom: ft + 1 },
+                lighten(base, 0.50),
+            );
+        }
+        // 左上柔光斑（宽度 30% 以内，避免读成白色划痕）
+        if fr - fl >= 8 && split - ft >= 2 {
+            fill_solid(
+                hdc,
+                &RECT { left: fl + 1, top: ft + 1, right: (fl + 1 + ((fr - fl) * 30) / 100).min(fr - 1), bottom: ft + 2 },
+                lighten(base, 0.34),
+            );
+        }
+        // 液柱底部反光暗带（贴壁的液体更暗）
+        if liq_h >= 4 {
+            fill_solid(
+                hdc,
+                &RECT { left: fl, top: fb - 1, right: fr, bottom: fb },
+                darken(base, 0.34),
+            );
         }
     }
-
-    // 上沿内阴影（凹陷错觉）：观察窗顶部 1px 深线
-    let shadow = &RECT {
-        left: win_l + 1,
-        top: win_t,
-        right: win_r - 1,
-        bottom: win_t + 1,
-    };
-    fill_solid(hdc, shadow, darken(well, 0.62));
-
-    // 下沿内高光（凹陷底部反光）：观察窗底部 1px 亮线
-    let inner_light = &RECT {
-        left: win_l + 1,
-        top: win_b - 1,
-        right: win_r - 1,
-        bottom: win_b,
-    };
-    fill_solid(hdc, inner_light, lighten(pal.surface, 0.16));
-
-    // ---- 5. 外框：顶部受光亮边收窄变柔 + 底部接地暗边 + 1px 深轮廓 ----
-    let top_edge = &RECT {
-        left: l + 3,
-        top: t,
-        right: body_r - 3,
-        bottom: t + 1,
-    };
-    fill_solid(hdc, top_edge, lighten(pal.surface, 0.34));
-
-    let bottom_edge = &RECT {
-        left: l + 2,
-        top: b - 1,
-        right: body_r - 2,
-        bottom: b,
-    };
-    fill_solid(hdc, bottom_edge, darken(pal.surface, 0.62));
-
-    stroke_round(hdc, l, t, body_r, b, radius, darken(pal.surface, 0.66));
 }
 
-/// 创建高质量 UI 字体：Segoe UI Variable Text / Segoe UI
+/// 充电时在电池上方叠加的闪电符号（Polygon 矢量绘制，非字体字形）
+/// 7x7 像素闪电掩码（`#` = 点亮）。
+/// 为什么不用多边形：电池观察窗在竖排任务栏里只有 ~13x16 px，此时 6 点归一化闪电
+/// 的水平边（0.42→0.30、0.92→0.56）不足 1px，GDI 填充规则把它们并成一条竖杠，
+/// 渲染结果是一个「⊢」而不是闪电。像素掩码在任意尺寸都能保持可辨识。
+const BOLT_MASK: [&str; 7] = [
+    "..##..",
+    "..#...",
+    ".##...",
+    "####..",
+    ".#....",
+    "#.....",
+    "##....",
+];
+
+/// 拟物化充电闪电：以最近邻缩放掩码填像素，保证小尺寸下轮廓不糊。
+/// h/w 中取较小者作为等边边长并居中。
+/// 先在 (+1,+1) 偏移处铺一层深色，再叠主色 —— 与本模块文字浮雕底衬同一套做法，
+/// 闪电压在浅蓝液面上时靠这层暗边才立得住，否则白闪电直接消失在液面里。
+pub unsafe fn draw_charge_bolt(hdc: HDC, cx: i32, cy: i32, h: i32, w: i32, color: COLORREF) {
+    let side = h.min(w);
+    if side < 5 {
+        return;
+    }
+    let mh = BOLT_MASK.len() as i32;
+    let mw = BOLT_MASK[0].len() as i32;
+    let x0 = cx - side / 2;
+    let y0 = cy - side / 2;
+
+    let old_p = SelectObject(hdc, GetStockObject(NULL_PEN));
+    // pass 0 = 暗色投影（偏移 +1,+1），pass 1 = 主色
+    for pass in 0..2i32 {
+        let c = if pass == 0 { darken(color, 0.74) } else { color };
+        let off = if pass == 0 { 1 } else { 0 };
+        let brush = CreateSolidBrush(c);
+        let old_b = SelectObject(hdc, brush.into());
+        for dy in 0..side {
+            let sy = (dy * mh) / side;
+            for dx in 0..side {
+                let sx = (dx * mw) / side;
+                if BOLT_MASK[sy as usize].as_bytes()[sx as usize] == b'#' {
+                    fill_solid(
+                        hdc,
+                        &RECT {
+                            left: x0 + dx + off,
+                            top: y0 + dy + off,
+                            right: x0 + dx + 1 + off,
+                            bottom: y0 + dy + 1 + off,
+                        },
+                        c,
+                    );
+                }
+            }
+        }
+        SelectObject(hdc, old_b);
+        let _ = DeleteObject(brush.into());
+    }
+    SelectObject(hdc, old_p);
+}
+
+/// 创建高质量 UI 字体：Segoe UI Variable Text / Segoe UI（ClearType 亚像素）
 pub fn create_ui_font(height_px: i32, weight: i32) -> HFONT {
+    create_ui_font_q(height_px, weight, CLEARTYPE_QUALITY())
+}
+
+/// 同上，但用灰度抗锯齿。任务栏条上的文字落在深色底上，ClearType 的 RGB 亚像素
+/// 边会在 10~12px 字号下显出彩边（实测截图里 "On A/C" 呈橙蓝重影），
+/// 灰度 AA 在深底上干净得多。
+pub fn create_ui_font_gray(height_px: i32, weight: i32) -> HFONT {
+    create_ui_font_q(height_px, weight, ANTIALIASED_QUALITY)
+}
+
+fn create_ui_font_q(height_px: i32, weight: i32, quality: FONT_QUALITY) -> HFONT {
     unsafe {
         let face: windows_core::HSTRING = "Segoe UI Variable Text".into();
         let h = CreateFontW(
@@ -363,7 +543,7 @@ pub fn create_ui_font(height_px: i32, weight: i32) -> HFONT {
             DEFAULT_CHARSET(),
             OUT_DEFAULT_PRECIS(),
             CLIP_DEFAULT_PRECIS(),
-            CLEARTYPE_QUALITY(),
+            quality,
             0,
             windows_core::PCWSTR::from_raw(face.as_ptr()),
         );
@@ -381,7 +561,7 @@ pub fn create_ui_font(height_px: i32, weight: i32) -> HFONT {
                 DEFAULT_CHARSET(),
                 OUT_DEFAULT_PRECIS(),
                 CLIP_DEFAULT_PRECIS(),
-                CLEARTYPE_QUALITY(),
+                quality,
                 0,
                 windows_core::PCWSTR::from_raw(fallback.as_ptr()),
             )

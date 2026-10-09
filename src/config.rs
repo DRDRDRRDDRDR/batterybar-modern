@@ -35,6 +35,20 @@ pub struct Config {
     pub show_rate_in_tooltip: bool, // 悬停显示 mW 功耗
     pub learn_profiles: bool, // 电池全寿命学习预测
     pub battery_style: u32, // 0=经典拟物 Aero Glass, 1=现代 Fluent
+
+    // ---- Advanced（原版 Advanced Settings 扩展）----
+    /// 自定义电量警报阈值（0 = 关闭），掉到该电量时弹气泡 + 播提示音
+    pub alarm_percent: i32,
+    /// 临界电量自动动作：0=无 1=睡眠 2=关机 3=休眠 4=重启
+    pub critical_action: u32,
+    /// 任务栏条背景不透明度 0..=100（0 = 完全透明）
+    pub bar_opacity: i32,
+    /// 文字字号档位：0=小(10) 1=中(12) 2=大(14)
+    pub font_size: u32,
+    /// 左键单击行为：0=循环切换显示模式 1=直接弹出详情卡片
+    pub on_click_mode: u32,
+    /// 接通电源时隐藏电池条
+    pub hide_on_ac: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +81,12 @@ impl Default for Config {
             show_rate_in_tooltip: true,
             learn_profiles: true,
             battery_style: 0,
+            alarm_percent: 0,
+            critical_action: 0,
+            bar_opacity: 100,
+            font_size: 1,
+            on_click_mode: 0,
+            hide_on_ac: false,
         }
     }
 }
@@ -116,6 +136,12 @@ impl Config {
                 "show_rate_in_tooltip" => c.show_rate_in_tooltip = v == "true",
                 "learn_profiles" => c.learn_profiles = v == "true",
                 "battery_style" => c.battery_style = v.parse().unwrap_or(0),
+                "alarm_percent" => c.alarm_percent = v.parse().unwrap_or(0).clamp(0, 100),
+                "critical_action" => c.critical_action = v.parse().unwrap_or(0).min(4),
+                "bar_opacity" => c.bar_opacity = v.parse().unwrap_or(100).clamp(0, 100),
+                "font_size" => c.font_size = v.parse().unwrap_or(1).min(2),
+                "on_click_mode" => c.on_click_mode = v.parse().unwrap_or(0).min(1),
+                "hide_on_ac" => c.hide_on_ac = v == "true",
                 _ => {}
             }
         }
@@ -135,7 +161,7 @@ impl Config {
             DisplayMode::Icon => "icon",
         };
         let text = format!(
-            "{{\n  \"show_tooltip\": {},\n  \"hide_when_full\": {},\n  \"run_at_startup\": {},\n  \"default_mode\": \"{}\",\n  \"alternate_on_click\": {},\n  \"only_percent_when_charging\": {},\n  \"bar_width\": {},\n  \"low_percent\": {},\n  \"critical_percent\": {},\n  \"notify_low\": {},\n  \"notify_critical\": {},\n  \"notify_full\": {},\n  \"play_sound\": {},\n  \"show_rate_in_tooltip\": {},\n  \"learn_profiles\": {},\n  \"battery_style\": {}\n}}\n",
+            "{{\n  \"show_tooltip\": {},\n  \"hide_when_full\": {},\n  \"run_at_startup\": {},\n  \"default_mode\": \"{}\",\n  \"alternate_on_click\": {},\n  \"only_percent_when_charging\": {},\n  \"bar_width\": {},\n  \"low_percent\": {},\n  \"critical_percent\": {},\n  \"notify_low\": {},\n  \"notify_critical\": {},\n  \"notify_full\": {},\n  \"play_sound\": {},\n  \"show_rate_in_tooltip\": {},\n  \"learn_profiles\": {},\n  \"battery_style\": {},\n  \"alarm_percent\": {},\n  \"critical_action\": {},\n  \"bar_opacity\": {},\n  \"font_size\": {},\n  \"on_click_mode\": {},\n  \"hide_on_ac\": {}\n}}\n",
             self.show_tooltip,
             self.hide_when_full,
             self.run_at_startup,
@@ -152,6 +178,12 @@ impl Config {
             self.show_rate_in_tooltip,
             self.learn_profiles,
             self.battery_style,
+            self.alarm_percent,
+            self.critical_action,
+            self.bar_opacity,
+            self.font_size,
+            self.on_click_mode,
+            self.hide_on_ac,
         );
         let _ = std::fs::write(config_path(), text);
     }

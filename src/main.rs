@@ -18,10 +18,9 @@ mod tray;
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreatePen, DeleteObject, DrawTextW, EndPaint, FillRect, InvalidateRect, LineTo,
-    MoveToEx, SelectObject, SetTextColor, DT_NOPREFIX, DT_SINGLELINE, PAINTSTRUCT, PS_SOLID,
+    BeginPaint, DrawTextW, EndPaint, InvalidateRect, DT_NOPREFIX, DT_SINGLELINE, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -32,9 +31,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
     GetMessageW, GetParent, IsWindowVisible, KillTimer, PostQuitMessage, RegisterClassW,
     RegisterWindowMessageW, SetForegroundWindow, SetTimer, ShowWindow, TrackPopupMenu,
-    TranslateMessage, CS_HREDRAW, CS_VREDRAW, MENU_ITEM_FLAGS, SHOW_WINDOW_CMD, SW_HIDE, SW_SHOW,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WNDCLASSW, WS_CHILD, WS_VISIBLE,
+    TranslateMessage, CS_HREDRAW, CS_VREDRAW, MENU_ITEM_FLAGS, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    WS_CHILD, WS_VISIBLE,
 };
 use windows_core::{w, PCWSTR};
 
@@ -98,6 +97,31 @@ fn mode_now() -> DisplayMode {
         3 => DisplayMode::Capacity,
         4 => DisplayMode::Icon,
         _ => DisplayMode::TimeRemaining,
+    }
+}
+
+/// 重绘任务栏条（Preferences 改完设置后调用）
+pub fn refresh_bar() {
+    let h = BAR_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        unsafe {
+            let _ = InvalidateRect(Some(HWND(h as *mut std::ffi::c_void)), None, false);
+        }
+    }
+}
+
+/// 是否接通外部电源（充电中，或 Win32 报告 ACLineStatus=1）
+fn on_ac_power() -> bool {
+    power::CHARGING.load(Ordering::Relaxed) || crate::power::AC_ON.load(Ordering::Relaxed)
+}
+
+/// 滚轮兜底转发：鼠标悬停在 Preferences 上时，把宿主收到的 WM_MOUSEWHEEL 转发过去。
+/// 起因：任务栏条是 Shell_TrayWnd 的子窗口，拿不到键盘焦点；而 WM_MOUSEWHEEL
+/// 只投递给**焦点窗口**而非鼠标所在窗口，导致设置面板滚轮完全无效。
+fn maybe_forward_wheel(wparam: WPARAM) {
+    if prefs::cursor_over_prefs() {
+        let delta = ((wparam.0 >> 16) as i16) as i32;
+        prefs::forward_wheel(delta);
     }
 }
 
@@ -258,8 +282,10 @@ fn relayout(bar: HWND) {
         let tb_w = trc.right - trc.left;
         let tb_h = trc.bottom - trc.top;
         if tb_h > tb_w {
-            // 竖排任务栏：宽度填满任务栏宽度，高度为 30px 紧凑精致卡片，位于托盘上方
-            let bar_h = 30i32;
+            // 竖排任务栏：宽度填满任务栏宽度。
+            // 高度 46px 而非 30px —— 30px 塞不下正规比例（约 1.8:1）的电池图标，
+            // 侧排文字也只剩 ~20px 放不下 "On A/C"；46px 可做「图标上 + 文字下」堆叠。
+            let bar_h = 46i32;
             let (y, _unused) = taskbar::tray_left_estimate(parent);
             let _ = taskbar::place(bar, 0, y - bar_h - 4, tb_w, bar_h);
         } else {
@@ -291,23 +317,31 @@ unsafe extern "system" fn bar_wndproc(
             LRESULT(0)
         }
         WAM::WM_LBUTTONUP => {
-            // 原版行为：点击在 时间剩余 / 百分比 / 功率速率 / 剩余容量 之间顺畅循环切换
+            // 原版行为：点击在 时间剩余 / 百分比 / 功率速率 / 剩余容量 / 仅图标 之间循环切换。
+            // Preferences → BEHAVIOR →「单击行为」可改为直接弹详情卡。
             let cfg = config_lock();
-            let alt = {
+            let (alt, click_mode) = {
                 let c = cfg.lock().unwrap();
-                c.alternate_on_click
+                (c.alternate_on_click, c.on_click_mode)
             };
-            if alt {
+            if click_mode == 1 {
+                popup::toggle_popup();
+            } else if alt {
                 let next = match mode_now() {
                     DisplayMode::TimeRemaining => DisplayMode::Percent,
                     DisplayMode::Percent => DisplayMode::DischargeRate,
                     DisplayMode::DischargeRate => DisplayMode::Capacity,
+                    DisplayMode::Capacity => DisplayMode::Icon,
                     _ => DisplayMode::TimeRemaining,
                 };
                 set_mode(next);
                 save_mode();
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
+            LRESULT(0)
+        }
+        0x020A /* WM_MOUSEWHEEL */ => {
+            maybe_forward_wheel(wparam);
             LRESULT(0)
         }
         WAM::WM_RBUTTONUP => {
@@ -523,20 +557,38 @@ fn handle_menu_cmd(hwnd: HWND, cmd: usize) {
 }
 
 /// 低电/临界/满电 通知（原版 Notifications + Warning Levels）
+///
+/// 支持：低电 / 临界 / 满电气泡、临界电量自定义阈值（取 low 与 alarm 的更小者）、
+/// 系统提示音、临界电量自动动作（睡眠/关机/休眠/重启）、满电或接通电源时隐藏条。
 fn check_notifications(pct: i32, charging: bool) {
     use std::sync::atomic::{AtomicBool, Ordering as O};
     let cfg = config_lock();
-    let (low, crit, n_low, n_crit, n_full, hide_full) = {
+    let (low, crit, n_low, n_crit, n_full, hide_full, alarm, crit_action, hide_on_ac, play_sound) = {
         let c = cfg.lock().unwrap();
-        (c.low_percent, c.critical_percent, c.notify_low, c.notify_critical, c.notify_full, c.hide_when_full)
+        (
+            c.low_percent,
+            c.critical_percent,
+            c.notify_low,
+            c.notify_critical,
+            c.notify_full,
+            c.hide_when_full,
+            c.alarm_percent,
+            c.critical_action,
+            c.hide_on_ac,
+            c.play_sound,
+        )
     };
 
-    // 满电隐藏
-    if hide_full {
+    // 阈值：alarm_percent > 0 时取更严格的那个
+    let low = if alarm > 0 { low.min(alarm) } else { low };
+    let ac = on_ac_power();
+
+    // 自动隐藏：满电 且开启 hide_on_ac 则整条隐藏（接通电源就没有续航焦虑）
+    if hide_full || hide_on_ac {
         let bh = BAR_HWND.load(Ordering::Relaxed);
         if bh != 0 {
             let bar = HWND(bh as *mut _);
-            let should_hide = pct >= 100 && charging;
+            let should_hide = (hide_full && pct >= 100 && charging) || (hide_on_ac && ac);
             let vis = unsafe { IsWindowVisible(bar).as_bool() };
             if should_hide && vis {
                 unsafe { let _ = ShowWindow(bar, SW_HIDE); }
@@ -549,6 +601,8 @@ fn check_notifications(pct: i32, charging: bool) {
     static FULL_LATCH: AtomicBool = AtomicBool::new(false);
     static LOW_LATCH: AtomicBool = AtomicBool::new(false);
     static CRIT_LATCH: AtomicBool = AtomicBool::new(false);
+    static ALARM_LATCH: AtomicBool = AtomicBool::new(false);
+    static ACT_LATCH: AtomicBool = AtomicBool::new(false);
 
     let th = TRAY_HWND.load(Ordering::Relaxed);
     if th == 0 {
@@ -561,27 +615,78 @@ fn check_notifications(pct: i32, charging: bool) {
         if !FULL_LATCH.swap(true, O::Relaxed) {
             t.balloon("BatteryBar Modern", "电池已充满，可以拔掉电源了。",
                 windows::Win32::UI::Shell::NIIF_INFO);
+            if play_sound { t.sound(); }
         }
     } else if pct < 100 {
         FULL_LATCH.store(false, O::Relaxed);
     }
+
+    // 临界动作文案：按用户选择的动作预告下一步
+    let crit_hint = match crit_action {
+        1 => "即将自动进入睡眠",
+        2 => "即将自动关机",
+        3 => "即将自动进入休眠",
+        4 => "即将自动重启",
+        _ => "请立即接通电源",
+    };
+
     // 临界：放+≤crit 边沿
     if n_crit && !charging && pct <= crit {
         if !CRIT_LATCH.swap(true, O::Relaxed) {
-            t.balloon("电量临界", &format!("电池仅剩 {}%，请立即接通电源！", pct),
+            t.balloon("电量临界",
+                &format!("电池仅剩 {}%，{}！", pct, crit_hint),
                 windows::Win32::UI::Shell::NIIF_WARNING);
+            if play_sound { t.sound(); }
         }
     } else if charging || pct > crit {
         CRIT_LATCH.store(false, O::Relaxed);
     }
+
     // 低电：放+≤low 边沿
     if n_low && !charging && pct <= low {
         if !LOW_LATCH.swap(true, O::Relaxed) {
             t.balloon("电量不足", &format!("电池仅剩 {}%，建议接通电源。", pct),
                 windows::Win32::UI::Shell::NIIF_WARNING);
+            if play_sound { t.sound(); }
         }
     } else if charging || pct > low {
         LOW_LATCH.store(false, O::Relaxed);
+    }
+
+    // 自定义电量警报（alarm_percent，与低电阈值取更小者）
+    if alarm > 0 && !charging && pct <= alarm {
+        if !ALARM_LATCH.swap(true, O::Relaxed) {
+            t.balloon("电量警报", &format!("电量已降至 {}%，达到自定义警报线。", pct),
+                windows::Win32::UI::Shell::NIIF_WARNING);
+        }
+    } else if charging || pct > alarm {
+        ALARM_LATCH.store(false, O::Relaxed);
+    }
+
+    // 临界电量自动动作（边沿触发，一次只做一次；执行前把 latch 置位防抖动重复触发）
+    if crit_action > 0 && !charging && pct <= crit {
+        if !ACT_LATCH.swap(true, O::Relaxed) {
+            run_critical_action(crit_action);
+        }
+    } else {
+        ACT_LATCH.store(false, O::Relaxed);
+    }
+}
+
+/// 临界电量自动动作
+/// 1=睡眠 2=关机 3=休眠 4=重启
+pub fn run_critical_action(action: u32) {
+    let mut run = |exe: &str, args: &[&str]| {
+        let _ = std::process::Command::new(exe).args(args).spawn();
+    };
+    match action {
+        // SetSuspendState(Hibernate=0, ForceCritical=1, DisableWakeEvent=0) → 睡眠
+        1 => run("rundll32.exe", &["powrprof.dll,SetSuspendState", "0,1,0"]),
+        // SetSuspendState(Hibernate=1, ...) → 休眠
+        3 => run("rundll32.exe", &["powrprof.dll,SetSuspendState", "0,0,0"]),
+        2 => run("shutdown.exe", &["/s", "/t", "0"]),
+        4 => run("shutdown.exe", &["/r", "/t", "0"]),
+        _ => {}
     }
 }
 
@@ -666,6 +771,11 @@ unsafe extern "system" fn msg_wndproc(
             power::poll_once();
             LRESULT(0)
         }
+        0x020A /* WM_MOUSEWHEEL */ => {
+            // 光标在 Preferences 上时，把滚轮转发给设置面板
+            maybe_forward_wheel(wparam);
+            LRESULT(0)
+        }
         WAM::WM_DESTROY => {
             let t = tray::TrayIcon { hwnd };
             t.remove();
@@ -684,10 +794,12 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
     let cfg = config_lock();
     let c = cfg.lock().unwrap();
 
-    // 任务栏底色铺底
+    // 任务栏底色铺底（支持不透明度：<100 时 AlphaBlend 让任务栏自身 Acrylic 透上来）
     let (tr, tg, tb) = if dark { c.dark_taskbar_tint } else { c.light_taskbar_tint };
     let bg = render::rgb(tr, tg, tb);
-    render::fill_solid(hdc, rc, bg);
+    if !render::fill_solid_alpha(hdc, rc, bg, c.bar_opacity) {
+        render::fill_solid(hdc, rc, bg);
+    }
     render::set_bk_transparent(hdc);
 
     let pct = power::PERCENT.load(Ordering::Relaxed);
@@ -705,23 +817,10 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         return;
     }
 
-    // 1. 拟物化实体电池（Skeuomorphic Battery：金属外壳 + 正极端子 + 内凹观察窗 + 液面）
-    let low = pct <= c.low_percent;
-    let critical = pct <= c.critical_percent;
-    render::draw_skeuo_battery(
-        hdc,
-        card_l,
-        card_t,
-        card_r,
-        card_b,
-        pct,
-        charging,
-        low,
-        critical,
-        &pal,
-    );
+    let avail_w = card_r - card_l;
+    let avail_h = card_b - card_t;
 
-    // 2. 文字内容构建（大号加粗立体浮雕字，水平绝对居中）
+    // 1. 文字内容构建（先于布局计算，才能按文字长度决定字号）
     let eta = power::ETA_SECONDS.load(Ordering::Relaxed);
     let cur_mode = mode_now();
 
@@ -736,9 +835,9 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
                     if pct >= 100 {
                         "On A/C".to_string()
                     } else if eta > 0 {
-                        format!("⚡ {}:{:02}", eta / 3600, (eta % 3600) / 60)
+                        format!("{}:{:02}", eta / 3600, (eta % 3600) / 60)
                     } else {
-                        "⚡ 充电中".to_string()
+                        "充电中".to_string()
                     }
                 } else if eta > 0 {
                     format!("{}:{:02}", eta / 3600, (eta % 3600) / 60)
@@ -747,11 +846,8 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
                 }
             }
             DisplayMode::Percent => {
-                if charging {
-                    format!("⚡ {}%", pct)
-                } else {
-                    format!("{}%", pct)
-                }
+                // 充电标识由电池图标上的闪电承担，文字不再重复加 ⚡（小字号会糊成一团）
+                format!("{}%", pct)
             }
             DisplayMode::DischargeRate => {
                 let mw = power::CHARGE_RATE_MW.load(Ordering::Relaxed);
@@ -775,104 +871,88 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         }
     };
 
+    // 2. 布局：字号档位 0=小 1=中 2=大（Preferences → DISPLAY 可调）
+    //    宽条（横排任务栏，≥104px）侧排：图标左 + 文字右
+    //    窄条（竖排任务栏 81px）堆叠：图标上 + 文字下（侧排会把文字挤没）
+    let fs = c.font_size as i32;
+    let (icon_l, icon_t, icon_r, icon_b, font_pt, text_mid) = if avail_w >= 104 {
+        let icon_h = (avail_h - 4).min(30);
+        let icon_w = (icon_h * 18) / 10;
+        let icon_l = card_l + 2;
+        let icon_t = card_t + (avail_h - icon_h) / 2;
+        let mid = (card_t + card_b) / 2;
+        (icon_l, icon_t, icon_l + icon_w, icon_t + icon_h, 11 + fs, mid)
+    } else {
+        let text_h = 12 + fs * 2;
+        let icon_h = (avail_h - text_h - 5).clamp(12, 24);
+        let icon_w = ((icon_h * 18) / 10).min(avail_w - 8);
+        let icon_l = card_l + (avail_w - icon_w) / 2;
+        let icon_t = card_t + 1;
+        let icon_b = icon_t + icon_h;
+        let text_mid = (icon_b + card_b) / 2;
+        (icon_l, icon_t, icon_l + icon_w, icon_b, 9 + fs, text_mid)
+    };
+
+    // 3. 拟物化实体电池（金属外壳 + 正极端子 + 内凹观察窗 + 电解液液面）
+    let low = pct <= c.low_percent;
+    let critical = pct <= c.critical_percent;
+    render::draw_battery_icon(
+        hdc,
+        icon_l,
+        icon_t,
+        icon_r,
+        icon_b,
+        pct,
+        charging,
+        low,
+        critical,
+        &pal,
+    );
+
+    // 充电时在观察窗内叠加拟物闪电（7x7 像素掩码最近邻缩放，小尺寸不糊）
+    if charging {
+        let side = ((icon_b - icon_t) * 58) / 100;
+        if side >= 5 {
+            render::draw_charge_bolt(
+                hdc,
+                (icon_l + icon_r) / 2,
+                (icon_t + icon_b) / 2,
+                side,
+                side,
+                render::lighten(pal.accent_blue, 0.74),
+            );
+        }
+    }
+
+    // 4. 文字：灰度抗锯齿 + Telegram 单色。文字只落在任务栏底色上（不压电池），
+    //    对比度已足够，不需要浮雕底衬——10px 字号下 1px 暗影会变成脏重影。
     if !text.is_empty() {
         let mut buf: Vec<u16> = text.encode_utf16().collect();
-        let font = render::create_ui_font(13, 600);
+        let font = render::create_ui_font_gray(font_pt, 600);
         let old_font = SelectObject(hdc, font.into());
 
         let mut size = windows::Win32::Foundation::SIZE::default();
         let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
 
-        let cx = (card_l + card_r) / 2;
-        let cy = (card_t + card_b) / 2;
-        let tx = cx - size.cx / 2;
-        let ty = cy - size.cy / 2;
-
-        // Telegram 单色高清晰字体排版（无杂色毛边）
-        SetTextColor(hdc, pal.text);
-        let mut drc_text = RECT {
-            left: tx,
-            top: ty,
-            right: tx + size.cx + 2,
-            bottom: ty + size.cy + 2,
+        let (text_l, text_w) = if avail_w >= 104 {
+            (icon_r + 7, card_r - (icon_r + 7))
+        } else {
+            ((card_l + card_r) / 2 - size.cx / 2, size.cx)
         };
+        let text_t = text_mid - size.cy / 2;
+
+        let mut drc_text = RECT {
+            left: text_l,
+            top: text_t,
+            right: text_l + text_w + 2,
+            bottom: text_t + size.cy + 2,
+        };
+        SetTextColor(hdc, pal.text);
         DrawTextW(hdc, &mut buf, &mut drc_text, DT_NOPREFIX | DT_SINGLELINE);
 
         SelectObject(hdc, old_font);
         let _ = DeleteObject(font.into());
-    } else if c.default_mode == DisplayMode::Icon {
-        // 图标居中模式
-        let icon_w = 26i32;
-        let icon_h = 13i32;
-        let ix = (card_l + card_r) / 2 - icon_w / 2;
-        let iy = (card_t + card_b) / 2 - icon_h / 2;
-        draw_battery_icon(hdc, ix, iy, icon_w, icon_h, pct, charging, render::rgb(76, 175, 80), &pal);
     }
-}
-
-/// 画小电池图标：外壳 + 电量填充 + 充电闪电
-unsafe fn draw_battery_icon(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-    pct: i32,
-    charging: bool,
-    fill: COLORREF,
-    pal: &Palette,
-) {
-    let body_w = w - 4; // 留 4px 给正极头
-    // 外壳（描边）
-    let pen = CreatePen(PS_SOLID, 1, pal.text_dim);
-    let old_pen = SelectObject(hdc, pen.into());
-    let old_brush_hollow = {
-        use windows::Win32::Graphics::Gdi::{GetStockObject, HOLLOW_BRUSH};
-        SelectObject(hdc, GetStockObject(HOLLOW_BRUSH))
-    };
-    let _ = WAM_StrokeRect(hdc, x, y, x + body_w, y + h);
-    SelectObject(hdc, old_brush_hollow);
-    SelectObject(hdc, old_pen);
-    let _ = DeleteObject(pen.into());
-    // 正极头
-    render::fill_round(hdc, x + body_w, y + h / 2 - 2, x + w, y + h / 2 + 2, 1, pal.text_dim);
-    // 内部填充（留 2px 内缩）
-    let frac = pct.clamp(0, 100) as i64;
-    let inner_w = ((body_w - 4) as i64 * frac / 100) as i32;
-    if inner_w > 2 {
-        render::fill_round(hdc, x + 2, y + 2, x + 2 + inner_w, y + h - 2, 1, fill);
-    }
-    let _ = charging;
-}
-
-unsafe fn WAM_StrokeRect(
-    hdc: windows::Win32::Graphics::Gdi::HDC,
-    l: i32,
-    t: i32,
-    r: i32,
-    b: i32,
-) -> windows_core::Result<()> {
-    use windows::Win32::Graphics::Gdi::{LineTo, MoveToEx};
-    let _ = MoveToEx(hdc, l, t, None);
-    let _ = LineTo(hdc, r, t);
-    let _ = LineTo(hdc, r, b);
-    let _ = LineTo(hdc, l, b);
-    let _ = LineTo(hdc, l, t);
-    Ok(())
-}
-
-fn lerp_color(a: COLORREF, b: COLORREF, t: f32) -> COLORREF {
-    let ar = (a.0 & 0xFF) as f32;
-    let ag = ((a.0 >> 8) & 0xFF) as f32;
-    let ab = ((a.0 >> 16) & 0xFF) as f32;
-    let br = (b.0 & 0xFF) as f32;
-    let bg = ((b.0 >> 8) & 0xFF) as f32;
-    let bb = ((b.0 >> 16) & 0xFF) as f32;
-    let t = t.clamp(0.0, 1.0);
-    let r = (ar + (br - ar) * t) as u32;
-    let g = (ag + (bg - ag) * t) as u32;
-    let bl = (ab + (bb - ab) * t) as u32;
-    COLORREF(r | (g << 8) | (bl << 16))
 }
 
 /// 菜单切模式后保存到 options.json
