@@ -51,7 +51,7 @@ impl TrayIcon {
             for (i, c) in tip.iter().take(128).enumerate() {
                 nid.szTip[i] = *c;
             }
-            Shell_NotifyIconW(NIM_ADD, &nid);
+            let _ = Shell_NotifyIconW(NIM_ADD, &nid);
         }
         Ok(Self { hwnd })
     }
@@ -69,7 +69,7 @@ impl TrayIcon {
             nid.szTip[i] = *c;
         }
         unsafe {
-            Shell_NotifyIconW(NIM_MODIFY, &nid);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
     }
 
@@ -90,7 +90,7 @@ impl TrayIcon {
         nid.hWnd = self.hwnd;
         nid.uID = TRAY_ID;
         unsafe {
-            Shell_NotifyIconW(NIM_DELETE, &nid);
+            let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
         }
     }
 
@@ -115,7 +115,7 @@ impl TrayIcon {
             nid.szInfo[i] = *c;
         }
         unsafe {
-            Shell_NotifyIconW(NIM_MODIFY, &nid);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
     }
 }

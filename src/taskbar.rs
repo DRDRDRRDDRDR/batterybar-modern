@@ -15,10 +15,9 @@ use windows_core::{PCWSTR, w};
 
 pub struct TaskbarInfo {
     pub hwnd: HWND,
-    pub rect: RECT,
 }
 
-/// 枚举任务栏（主 + 副屏），返回 (hwnd, rect)
+/// 枚举任务栏（主 + 副屏），返回主任务栏在前
 pub fn find_taskbars() -> Vec<TaskbarInfo> {
     unsafe {
         let mut out = Vec::new();
@@ -26,14 +25,14 @@ pub fn find_taskbars() -> Vec<TaskbarInfo> {
         if let Ok(main) = FindWindowW(class, PCWSTR::null()) {
             let mut rc = RECT::default();
             if GetWindowRect(main, &mut rc).is_ok() {
-                out.push(TaskbarInfo { hwnd: main, rect: rc });
+                out.push(TaskbarInfo { hwnd: main });
             }
         }
         let sec: PCWSTR = w!("Shell_SecondaryTrayWnd");
         if let Ok(sec_bar) = FindWindowW(sec, PCWSTR::null()) {
             let mut rc = RECT::default();
             if GetWindowRect(sec_bar, &mut rc).is_ok() {
-                out.push(TaskbarInfo { hwnd: sec_bar, rect: rc });
+                out.push(TaskbarInfo { hwnd: sec_bar });
             }
         }
         out

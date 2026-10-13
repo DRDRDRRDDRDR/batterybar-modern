@@ -42,7 +42,6 @@ struct Prefs {
     font_section: windows::Win32::Graphics::Gdi::HFONT,
     font_label: windows::Win32::Graphics::Gdi::HFONT,
     font_value: windows::Win32::Graphics::Gdi::HFONT,
-    font_sub: windows::Win32::Graphics::Gdi::HFONT,
 }
 
 struct PrefsBox(Prefs);
@@ -247,7 +246,6 @@ pub fn toggle_prefs() {
             font_section: render::create_ui_font(12, 600),
             font_label: render::create_ui_font(13, 500),
             font_value: render::create_ui_font(13, 600),
-            font_sub: render::create_ui_font(11, 400),
         }));
 
         let pref = DWMWCP_ROUND.0;
@@ -498,7 +496,12 @@ unsafe fn handle_click(hwnd: HWND, click_y: i32) {
             }
             "hide_on_ac" => { c.hide_on_ac = !c.hide_on_ac; save = true; }
             "show_rate_in_tooltip" => { c.show_rate_in_tooltip = !c.show_rate_in_tooltip; save = true; }
-            "learn_profiles" => { c.learn_profiles = !c.learn_profiles; save = true; }
+            "learn_profiles" => {
+                c.learn_profiles = !c.learn_profiles;
+                // 立即同步到数据层：关闭后不再写 battery_history.jsonl、不再更新学习值
+                crate::power::LEARN_ENABLED.store(c.learn_profiles, Ordering::Relaxed);
+                save = true;
+            }
             "reset_history" => {
                 let mut p = std::env::current_exe().unwrap_or_default();
                 p.pop();
@@ -509,6 +512,9 @@ unsafe fn handle_click(hwnd: HWND, click_y: i32) {
                 let def = Config::default();
                 *c = def;
                 c.save();
+                // 重置后把学习开关同步回默认值
+                crate::power::LEARN_ENABLED.store(c.learn_profiles, Ordering::Relaxed);
+                crate::set_mode(c.default_mode);
             }
             _ => {}
         }

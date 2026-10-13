@@ -209,9 +209,9 @@ impl Config {
                 let path = std::env::current_exe()
                     .map(|p| format!("\"{}\" /minimized", p.display()))
                     .unwrap_or_default();
-                let mut wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-                let bytes =
-                    unsafe { std::slice::from_raw_parts_mut(wide.as_mut_ptr() as *mut u8, wide.len() * 2) };
+                let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+                // REG_SZ 需要字节视图（含结尾 NUL），字符串本身作为字节序列写入
+                let bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
                 let _ = RegSetValueExW(hkey, val, None, REG_SZ, Some(bytes));
             } else {
                 let _ = RegDeleteValueW(hkey, val);

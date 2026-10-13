@@ -5,6 +5,12 @@
 //   2. message window  —— 托盘图标宿主（不可见）
 //   3. popup window    —— Status Popup（原版 8 行字段复刻）
 //   4. prefs window    —— Preferences（原版 Preferences 复刻）
+//
+// 子系统：Release 必须显式声明 windows 子系统。
+// windows-gnu 目标默认按 console 子系统链接，不声明的话启动 exe 会附带一个
+// 控制台黑框窗口（PE Subsystem=3），任务栏里会多出一个 cmd 样的条目。
+// debug 构建保留 console，方便 eprintln! 调试输出。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(non_snake_case)]
 
 mod config;
@@ -43,9 +49,15 @@ use crate::render::{palette_dark, palette_light, Palette};
 // ---- 布局常量 ----
 const BAR_WIDTH: i32 = 150;
 const BAR_HEIGHT_PAD: i32 = 10;
-const BAR_HEIGHT_VERTICAL: i32 = 92;
+/// 竖排任务栏下条的固定高度。46px 是实测下限：再矮就放不下约 1.8:1
+/// 正规比例的电池图标，侧排文字也只剩 ~20px 放不下 "On A/C"。
+const BAR_HEIGHT_VERTICAL: i32 = 46;
 const TIMER_REFRESH: usize = 1;
 const TIMER_HOVER: usize = 3;
+/// Explorer 重启自愈轮询间隔（ms）。Explorer 崩溃重启后 Shell_TrayWnd 会换新句柄，
+/// 我们的条窗口会被连带销毁或悬空，需要周期性检查并重新嵌入。
+const TIMER_REEMBED: usize = 4;
+const REEMBED_MS: u32 = 5_000;
 const REFRESH_MS: u32 = 1000;
 const HOVER_MS: u32 = 400;
 const TRAY_TIMER: usize = 2;
@@ -123,10 +135,6 @@ fn maybe_forward_wheel(wparam: WPARAM) {
         let delta = ((wparam.0 >> 16) as i16) as i32;
         prefs::forward_wheel(delta);
     }
-}
-
-struct BarWnd {
-    hwnd: HWND,
 }
 
 fn main() -> windows_core::Result<()> {
@@ -247,9 +255,24 @@ fn main() -> windows_core::Result<()> {
             eprintln!("battery init: {e}");
         }
 
-        // 6) 定时器：1s 变化检测重绘 + 30s 兜底轮询
+        // 5.5) 应用启动配置：显示模式 / 学习算法开关 / 开机自启注册项
+        {
+            let cfg = config_lock();
+            let (mode, learn, startup) = {
+                let c = cfg.lock().unwrap();
+                (c.default_mode, c.learn_profiles, c.run_at_startup)
+            };
+            set_mode(mode);
+            power::LEARN_ENABLED.store(learn, Ordering::Relaxed);
+            // 每次启动把注册表状态对齐到配置（用户可能在外部删过启动项）
+            let c = cfg.lock().unwrap().clone();
+            c.set_startup(startup);
+        }
+
+        // 6) 定时器：1s 变化检测重绘 + 30s 兜底轮询 + 5s Explorer 自愈检查
         let _ = SetTimer(Some(bar_hwnd), TIMER_REFRESH, REFRESH_MS, None);
         let _ = SetTimer(Some(msg_hwnd), TRAY_TIMER, TRAY_POLL_MS, None);
+        let _ = SetTimer(Some(msg_hwnd), TIMER_REEMBED, REEMBED_MS, None);
 
         // 7) 支持命令行直接打开设置面板
         let args: Vec<String> = std::env::args().collect();
@@ -285,7 +308,7 @@ fn relayout(bar: HWND) {
             // 竖排任务栏：宽度填满任务栏宽度。
             // 高度 46px 而非 30px —— 30px 塞不下正规比例（约 1.8:1）的电池图标，
             // 侧排文字也只剩 ~20px 放不下 "On A/C"；46px 可做「图标上 + 文字下」堆叠。
-            let bar_h = 46i32;
+            let bar_h = BAR_HEIGHT_VERTICAL;
             let (y, _unused) = taskbar::tray_left_estimate(parent);
             let _ = taskbar::place(bar, 0, y - bar_h - 4, tb_w, bar_h);
         } else {
@@ -391,8 +414,12 @@ unsafe extern "system" fn bar_wndproc(
                 }
                 check_notifications(pct as i32, chg != 0);
             } else if wparam.0 == TIMER_HOVER {
-                // hover 计时到：光标仍在条上则弹详情
+                // hover 计时到：光标仍在条上则弹详情（Preferences → GENERAL 可关掉悬停弹卡）
                 let _ = KillTimer(Some(hwnd), TIMER_HOVER);
+                let want_tip = { config_lock().lock().unwrap().show_tooltip };
+                if !want_tip {
+                    return LRESULT(0);
+                }
                 let mut pt = POINT::default();
                 let _ = WAM::GetCursorPos(&mut pt);
                 let mut rc = RECT::default();
@@ -428,8 +455,21 @@ unsafe extern "system" fn bar_wndproc(
     }
 }
 
+/// 静默启动子进程（CREATE_NO_WINDOW = 0x08000000）。
+///
+/// 本程序是 GUI 子系统，但 powercfg / shutdown / rundll32 都是控制台程序。
+/// 直接 spawn 的话，每次调用都会闪一个黑色控制台窗口 —— 对每秒/每分钟轮询
+/// 电源方案的场景尤其明显。加了这个 flag 后子进程不分配控制台。
+pub fn hidden_command(exe: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut c = std::process::Command::new(exe);
+    c.creation_flags(CREATE_NO_WINDOW);
+    c
+}
+
 fn get_active_power_scheme() -> String {
-    let out = std::process::Command::new("powercfg")
+    let out = hidden_command("powercfg")
         .arg("/getactivescheme")
         .output();
     if let Ok(o) = out {
@@ -447,7 +487,7 @@ fn get_active_power_scheme() -> String {
 }
 
 fn set_active_power_scheme(guid: &str) {
-    let _ = std::process::Command::new("powercfg")
+    let _ = hidden_command("powercfg")
         .args(&["/setactive", guid])
         .output();
 }
@@ -482,7 +522,7 @@ fn show_bar_menu(hwnd: HWND) {
 
             let mut pt = POINT::default();
             let _ = WAM::GetCursorPos(&mut pt);
-            SetForegroundWindow(hwnd);
+            let _ = SetForegroundWindow(hwnd);
             let cmd = TrackPopupMenu(
                 menu,
                 TPM_BOTTOMALIGN | TPM_RIGHTBUTTON | WAM::TPM_RETURNCMD,
@@ -676,8 +716,8 @@ fn check_notifications(pct: i32, charging: bool) {
 /// 临界电量自动动作
 /// 1=睡眠 2=关机 3=休眠 4=重启
 pub fn run_critical_action(action: u32) {
-    let mut run = |exe: &str, args: &[&str]| {
-        let _ = std::process::Command::new(exe).args(args).spawn();
+    let run = |exe: &str, args: &[&str]| {
+        let _ = hidden_command(exe).args(args).spawn();
     };
     match action {
         // SetSuspendState(Hibernate=0, ForceCritical=1, DisableWakeEvent=0) → 睡眠
@@ -771,6 +811,10 @@ unsafe extern "system" fn msg_wndproc(
             power::poll_once();
             LRESULT(0)
         }
+        WAM::WM_TIMER if wparam.0 == TIMER_REEMBED => {
+            reembed_if_needed();
+            LRESULT(0)
+        }
         0x020A /* WM_MOUSEWHEEL */ => {
             // 光标在 Preferences 上时，把滚轮转发给设置面板
             maybe_forward_wheel(wparam);
@@ -783,6 +827,58 @@ unsafe extern "system" fn msg_wndproc(
             LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Explorer 重启自愈。
+///
+/// Explorer 崩溃/重启后 Shell_TrayWnd 会换一个新句柄，旧任务栏连同我们 SetParent
+/// 进去的条窗口一起被销毁，电池条就永久消失了。这里每 5 秒检查一次：
+/// 条窗口还在不在？它的父窗口还是不是当前那个任务栏？不是就重建 + 重新嵌入。
+fn reembed_if_needed() {
+    unsafe {
+        let bh = BAR_HWND.load(Ordering::Relaxed);
+        let bar = HWND(bh as *mut _);
+        let taskbars = taskbar::find_taskbars();
+        let Some(tb) = taskbars.first() else { return };
+
+        // 条窗口已销毁 → 重建
+        if !taskbar::still_valid(bar) {
+            let Ok(hinstance) = GetModuleHandleW(PCWSTR::null()) else { return };
+            let Ok(new_bar) = CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("BBM_Bar"),
+                PCWSTR::null(),
+                WS_CHILD | WS_VISIBLE,
+                0,
+                0,
+                BAR_WIDTH,
+                BAR_HEIGHT_VERTICAL,
+                Some(tb.hwnd),
+                None,
+                Some(hinstance.into()),
+                None,
+            ) else {
+                return;
+            };
+            BAR_HWND.store(new_bar.0 as isize, Ordering::Relaxed);
+            let _ = SetTimer(Some(new_bar), TIMER_REFRESH, REFRESH_MS, None);
+            let _ = ShowWindow(new_bar, SW_SHOW);
+            relayout(new_bar);
+            let _ = InvalidateRect(Some(new_bar), None, false);
+            return;
+        }
+
+        // 条窗口还在，但父窗口已经不是当前任务栏 → 重新嵌入
+        let parent = GetParent(bar).unwrap_or_default();
+        if parent != tb.hwnd {
+            if taskbar::reparent(bar, tb.hwnd).is_ok() {
+                relayout(bar);
+                let _ = InvalidateRect(Some(bar), None, false);
+            }
+        } else if !taskbar::visible(bar) {
+            let _ = ShowWindow(bar, SW_SHOW);
+        }
     }
 }
 
@@ -824,12 +920,19 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
     let eta = power::ETA_SECONDS.load(Ordering::Relaxed);
     let cur_mode = mode_now();
 
-    let text = if cur_mode == DisplayMode::Icon {
+    // 充电时只显示电量百分比（Preferences → DISPLAY）：充电中强制走 Percent 分支
+    let eff_mode = if charging && c.only_percent_when_charging {
+        DisplayMode::Percent
+    } else {
+        cur_mode
+    };
+
+    let text = if eff_mode == DisplayMode::Icon {
         String::new()
     } else if pct < 0 {
         "—".to_string()
     } else {
-        match cur_mode {
+        match eff_mode {
             DisplayMode::TimeRemaining => {
                 if charging {
                     if pct >= 100 {
@@ -894,6 +997,7 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
     };
 
     // 3. 拟物化实体电池（金属外壳 + 正极端子 + 内凹观察窗 + 电解液液面）
+    //    或现代极简 Fluent（扁平轨道 + 圆角填充条），由 Preferences 的视觉主题风格决定
     let low = pct <= c.low_percent;
     let critical = pct <= c.critical_percent;
     render::draw_battery_icon(
@@ -906,6 +1010,7 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         charging,
         low,
         critical,
+        c.battery_style,
         &pal,
     );
 

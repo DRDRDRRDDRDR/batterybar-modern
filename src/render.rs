@@ -7,12 +7,12 @@
 // 5. 几何：连续平滑曲线药丸卡片 (Smooth Floating Pill)，摒弃粗陋切线与硬突起。
 #![allow(non_snake_case)]
 
-use windows::Win32::Foundation::{COLORREF, POINT, RECT};
+use windows::Win32::Foundation::{COLORREF, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, FillRect, Polygon, RoundRect,
-    SelectObject, SetBkMode, SetTextColor, ANTIALIASED_QUALITY, DT_VCENTER, DT_WORDBREAK,
-    DRAW_TEXT_FORMAT, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC,
-    HFONT, HGDIOBJ, TRANSPARENT, PS_SOLID, GetStockObject, HOLLOW_BRUSH, NULL_PEN,
+    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, FillRect, RoundRect, SelectObject,
+    SetBkMode, ANTIALIASED_QUALITY, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
+    FONT_QUALITY, HDC, HFONT, HGDIOBJ, TRANSPARENT, PS_SOLID, GetStockObject, HOLLOW_BRUSH,
+    NULL_PEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
@@ -280,6 +280,7 @@ pub unsafe fn draw_battery_icon(
     charging: bool,
     low: bool,
     critical: bool,
+    style: u32,
     pal: &Palette,
 ) {
     let w = r - l;
@@ -298,6 +299,15 @@ pub unsafe fn draw_battery_icon(
     } else {
         pal.accent_green
     };
+
+    // ---- 视觉主题风格（Preferences → DISPLAY → 视觉主题风格）----
+    // 1 = 现代极简 Fluent：无金属壳体、无端子，扁平轨道 + 圆角填充条
+    if style == 1 {
+        draw_fluent_battery(hdc, l, t, r, b, pct, base, pal);
+        return;
+    }
+
+    // 0 = 经典拟物 Aero Glass：以下走金属壳体 + 正极端子 + 内凹观察窗
 
     // 极小尺寸兜底：没有空间做拟物层次，只画一个带轮廓的色块
     if h < 12 || w < 20 {
@@ -456,6 +466,57 @@ pub unsafe fn draw_battery_icon(
     }
 }
 
+/// 现代极简 Fluent 风格电池（Preferences → 视觉主题风格 = 现代极简 Fluent）。
+/// 与拟物版的区别：没有金属壳体渐变、没有正极端子、没有内凹观察窗井，
+/// 只保留「扁平圆角轨道 + 圆角填充条 + 1px 细边」的 Win11 Fluent 语言。
+/// 这样在小尺寸下更干净，也和 Windows 11 设置页里的电池指示器一致。
+unsafe fn draw_fluent_battery(
+    hdc: HDC,
+    l: i32,
+    t: i32,
+    r: i32,
+    b: i32,
+    pct: i32,
+    base: COLORREF,
+    pal: &Palette,
+) {
+    let w = r - l;
+    let h = b - t;
+    let radius = ((h as f32 * 0.28).round() as i32).max(2);
+    // 端子：Fluent 版做成贴边的细圆角块，不做金属高光
+    let term_w = ((w as f32 * 0.075).round() as i32).max(2);
+    let term_h = ((h as f32 * 0.40).round() as i32).max(4);
+    let term_t = t + (h - term_h) / 2;
+    let body_r = r - term_w - 1;
+
+    // 轨道（未填充部分）：比边框更暗的中性槽
+    fill_round(hdc, l, t, body_r, b, radius, pal.track);
+    stroke_round(hdc, l, t, body_r, b, radius, pal.border);
+
+    // 端子
+    fill_round(hdc, body_r + 1, term_t, r, term_t + term_h, (term_w / 2).max(1), pal.text_dim);
+
+    // 填充条：内缩 2px，按 pct 从左侧铺开
+    let pad = 2i32;
+    let inner_l = l + pad;
+    let inner_r = body_r - pad;
+    let inner_w = inner_r - inner_l;
+    if inner_w > 2 && pct > 0 {
+        let fw = (inner_w * pct.clamp(0, 100) / 100).max(1);
+        let fr = (inner_l + fw).min(inner_r);
+        let ir = (radius - pad).max(1);
+        // 底部 1px 暗带制造轻微体积，但不做多段渐变
+        fill_round(hdc, inner_l, t + pad, fr, b - pad, ir, base);
+        if b - pad - (t + pad) > 5 {
+            fill_solid(
+                hdc,
+                &RECT { left: inner_l, top: b - pad - 1, right: fr, bottom: b - pad },
+                darken(base, 0.22),
+            );
+        }
+    }
+}
+
 /// 充电时在电池上方叠加的闪电符号（Polygon 矢量绘制，非字体字形）
 /// 7x7 像素闪电掩码（`#` = 点亮）。
 /// 为什么不用多边形：电池观察窗在竖排任务栏里只有 ~13x16 px，此时 6 点归一化闪电
@@ -584,13 +645,6 @@ pub fn CLEARTYPE_QUALITY() -> FONT_QUALITY {
     windows::Win32::Graphics::Gdi::CLEARTYPE_QUALITY
 }
 
-pub unsafe fn set_text_color(hdc: HDC, c: COLORREF) {
-    SetTextColor(hdc, c);
-}
-
 pub unsafe fn set_bk_transparent(hdc: HDC) {
     SetBkMode(hdc, TRANSPARENT);
 }
-
-pub const DT_VCENTER_FLAG: DRAW_TEXT_FORMAT = DT_VCENTER;
-pub const DT_WORDBREAK_FLAG: DRAW_TEXT_FORMAT = DT_WORDBREAK;

@@ -69,7 +69,7 @@ pub fn toggle_popup() {
             };
             OK = RegisterClassW(&wc) != 0;
         });
-        if unsafe { !OK } {
+        if !OK {
             return;
         }
 
@@ -182,7 +182,7 @@ unsafe extern "system" fn popup_wndproc(
 }
 
 fn get_active_power_scheme() -> String {
-    let out = std::process::Command::new("powercfg")
+    let out = crate::hidden_command("powercfg")
         .arg("/getactivescheme")
         .output();
     if let Ok(o) = out {
@@ -297,12 +297,21 @@ unsafe fn paint_popup(p: &Popup, hdc: HDC) {
         start_y + group_h + 10
     };
 
-    let group1 = [
+    // 「实时功耗」行受 Preferences → BATTERY TOOLS 的 show_rate_in_tooltip 控制
+    let show_rate = crate::config_lock().lock().unwrap().show_rate_in_tooltip;
+
+    let mut group1_rows: Vec<(&str, String, Option<windows::Win32::Foundation::COLORREF>)> = vec![
         ("电量容量", if full > 0 { format!("{:.1} / {:.1} Wh", rem as f64 / 1000.0, full as f64 / 1000.0) } else { "—".into() }, None),
-        ("实时功耗", if rate == 0 { "0 mW".into() } else { format!("{} mW", rate) }, Some(if rate < 0 { pal.accent_blue } else { pal.text })),
-        ("满电可用时长", fmt_hms(full_life), None),
     ];
-    let next_y = draw_cell_group(130, &group1);
+    if show_rate {
+        group1_rows.push((
+            "实时功耗",
+            if rate == 0 { "0 mW".into() } else { format!("{} mW", rate) },
+            Some(if rate < 0 { pal.accent_blue } else { pal.text }),
+        ));
+    }
+    group1_rows.push(("满电可用时长", fmt_hms(full_life), None));
+    let next_y = draw_cell_group(130, &group1_rows);
 
     let group2 = [
         ("电池损耗率", if health > 0 { format!("{}% (健康度 {}%)", 100 - health, health) } else { "—".into() }, Some(if health < 80 { pal.accent_warn } else { pal.accent_green })),

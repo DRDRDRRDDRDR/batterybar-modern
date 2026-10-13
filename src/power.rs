@@ -9,7 +9,7 @@ use windows::Devices::Power::{Battery, BatteryReport};
 use windows::Foundation::TypedEventHandler;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, RegisterWindowMessageW};
-use windows_core::{Interface, PCWSTR, Ref};
+use windows_core::{PCWSTR, Ref};
 
 pub const POWERDATA_CHANGED_MSG: &str = "BatteryBarModern.PowerDataChanged";
 
@@ -25,14 +25,12 @@ pub static ETA_SECONDS: AtomicU64 = AtomicU64::new(0); // 0 = 未知/满电
 pub static AVAILABLE: AtomicBool = AtomicBool::new(false); // 本机有无电池
 pub static FULL_LIFETIME_SECONDS: AtomicU64 = AtomicU64::new(0); // 满充可用时长(学习值)
 pub static ELAPSED_ON_BATTERY: AtomicU64 = AtomicU64::new(0); // 本次用电池已时长
-pub static VOLTAGE_MV: AtomicI32 = AtomicI32::new(0); // 电压(mV)
 /// Win32 ACLineStatus: 1=接通外部电源，0=使用电池（255=未知）
 pub static AC_ON: AtomicBool = AtomicBool::new(true);
 
-// 通知状态沿（true = 该事件已触发过，状态切换后复位）
-pub static NOTIFY_LOW_LATCH: AtomicBool = AtomicBool::new(false);
-pub static NOTIFY_CRITICAL_LATCH: AtomicBool = AtomicBool::new(false);
-pub static NOTIFY_FULL_LATCH: AtomicBool = AtomicBool::new(false);
+/// 全寿命自学习预测算法开关（Preferences → BATTERY TOOLS）。
+/// 关闭时不记录充放电历史、不计算学习值，ETA 只走系统/EMA 估算。
+pub static LEARN_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // ---- ETA 估算（指数滑动平均，防跳变）----
 
@@ -82,8 +80,17 @@ impl EtaTracker {
     }
 
     fn current_eta(&self) -> u64 {
-        let rate = self.rate_mwh_per_s;
-        if rate.abs() < 1e-6 {
+        let mut rate = self.rate_mwh_per_s.abs();
+        // 全寿命自学习：放电时把历史平均速率与实时 EMA 各半融合。
+        // 目的：刚拔电源的头几分钟 EMA 还在爬坡，纯 EMA 的 ETA 会剧烈跳动；
+        // 混入历史值后 ETA 从一开始就落在合理区间。
+        if !self.charging && LEARN_ENABLED.load(Ordering::Relaxed) {
+            let learned = learned_rate_cached();
+            if learned > 1e-6 {
+                rate = if rate < 1e-6 { learned } else { rate * 0.5 + learned * 0.5 };
+            }
+        }
+        if rate < 1e-6 {
             return 0;
         }
         let rem = if self.charging {
@@ -94,7 +101,7 @@ impl EtaTracker {
         if rem <= 0 {
             return 0;
         }
-        let eta = (rem as f64 / rate.abs()) as u64;
+        let eta = (rem as f64 / rate) as u64;
         eta.min(86_400) // 上限 24h，超出视为不可靠
     }
 
@@ -181,13 +188,15 @@ pub fn apply_report(report: &BatteryReport) {
     if let Ok(mut t) = ETA.lock() {
         let eta = t.feed(now_unix(), rem, charging || idle_ac);
         ETA_SECONDS.store(eta, Ordering::Relaxed);
-        // 全寿命学习值：EMA 的稳定速率下满电可用秒数
-        if t.rate_mwh_per_s > 1.0 && full > 0 {
+        // 全寿命学习值：EMA 的稳定速率下满电可用秒数（学习算法关闭时不写入）
+        if LEARN_ENABLED.load(Ordering::Relaxed) && t.rate_mwh_per_s > 1.0 && full > 0 {
             let full_life = (full as f64 / t.rate_mwh_per_s) as u64;
             FULL_LIFETIME_SECONDS.store(full_life.min(86_400 * 2), Ordering::Relaxed);
         }
-        // 放电记录（充→放切换时开新记录，放→充切换时落盘）
-        t.track_discharge(now_unix(), rem, charging || idle_ac, full);
+        // 放电记录（充→放切换时开新记录，放→充切换时落盘）；学习关闭则不落盘
+        if LEARN_ENABLED.load(Ordering::Relaxed) {
+            t.track_discharge(now_unix(), rem, charging || idle_ac, full);
+        }
     }
 
     ELAPSED_ON_BATTERY.store(if charging || idle_ac { 0 } else { now_unix().saturating_sub(ETA.lock().map(|t| t.last_sec).unwrap_or(now_unix())) }, Ordering::Relaxed);
@@ -320,6 +329,24 @@ fn trim_history() {
     let _ = std::fs::write(history_path(), lines.join("\n") + "\n");
 }
 
+/// 历史平均放电速率的进程内缓存（mWh/s）。
+/// learned_discharge_rate() 要读文件并逐行解析，而 current_eta() 每秒都会被调用；
+/// 这里缓存 5 分钟，避免每秒一次磁盘 IO。
+fn learned_rate_cached() -> f64 {
+    use std::sync::atomic::{AtomicI64, AtomicU64 as AU64};
+    static CACHED: AtomicI64 = AtomicI64::new(-1); // -1 = 未初始化；单位 1e-6 mWh/s
+    static STAMP: AU64 = AU64::new(0);
+    let now = now_unix();
+    let age = now.saturating_sub(STAMP.load(Ordering::Relaxed));
+    if CACHED.load(Ordering::Relaxed) >= 0 && age < 300 {
+        return CACHED.load(Ordering::Relaxed) as f64 / 1_000_000.0;
+    }
+    let v = learned_discharge_rate();
+    CACHED.store((v * 1_000_000.0) as i64, Ordering::Relaxed);
+    STAMP.store(now, Ordering::Relaxed);
+    v
+}
+
 /// 历史平均放电速率（mWh/s）；无数据返回 0
 pub fn learned_discharge_rate() -> f64 {
     let Ok(content) = std::fs::read_to_string(history_path()) else { return 0.0 };
@@ -327,7 +354,7 @@ pub fn learned_discharge_rate() -> f64 {
     let mut total_sec = 0u64;
     for line in content.lines().rev().take(HISTORY_MAX) {
         // 极简解析:{"from":N,"to":N,"sec":N}
-        let mut get = |key: &str| -> i64 {
+        let get = |key: &str| -> i64 {
             line.split(&format!("\"{}\":", key))
                 .nth(1)
                 .and_then(|s| s.split(['}', ',']).next())
