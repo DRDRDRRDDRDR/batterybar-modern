@@ -47,7 +47,10 @@ use crate::config::{Config, DisplayMode};
 use crate::render::{palette_dark, palette_light, Palette};
 
 // ---- 布局常量 ----
-const BAR_WIDTH: i32 = 150;
+/// 横排任务栏下条宽度下限：再窄就放不下「图标 + 文字」的最小排布。
+const BAR_WIDTH_MIN: i32 = 60;
+/// 横排任务栏下条宽度上限：超过 400 会挤占任务栏按钮区，没有实用价值。
+const BAR_WIDTH_MAX: i32 = 400;
 const BAR_HEIGHT_PAD: i32 = 10;
 /// 竖排任务栏下条的固定高度。46px 是实测下限：再矮就放不下约 1.8:1
 /// 正规比例的电池图标，侧排文字也只剩 ~20px 放不下 "On A/C"。
@@ -92,6 +95,14 @@ pub fn config_lock() -> &'static Mutex<Config> {
     CONFIG.get_or_init(|| Mutex::new(Config::load()))
 }
 
+/// 当前生效的横排条宽度（读配置 + 夹到合法区间）。
+///
+/// 竖排任务栏不用这个值 —— 那里条宽必须等于任务栏宽度，否则会看到缝。
+pub fn bar_width() -> i32 {
+    let w = config_lock().lock().unwrap().bar_width;
+    w.clamp(BAR_WIDTH_MIN, BAR_WIDTH_MAX)
+}
+
 pub fn set_mode(m: DisplayMode) {
     DISPLAY_MODE.store(match m {
         DisplayMode::TimeRemaining => 0,
@@ -119,6 +130,18 @@ pub fn refresh_bar() {
         unsafe {
             let _ = InvalidateRect(Some(HWND(h as *mut std::ffi::c_void)), None, false);
         }
+    }
+}
+
+/// 按当前配置重新计算条的位置与尺寸。
+///
+/// 改「电池条宽度」「接通电源时隐藏条」这类会影响几何的设置后必须调用 ——
+/// 只 InvalidateRect 重绘是不够的，窗口尺寸没变，新宽度不会生效。
+pub fn relayout_bar() {
+    let h = BAR_HWND.load(Ordering::Relaxed);
+    if h != 0 {
+        relayout(HWND(h as *mut std::ffi::c_void));
+        refresh_bar();
     }
 }
 
@@ -212,7 +235,7 @@ fn main() -> windows_core::Result<()> {
             WS_CHILD | WS_VISIBLE,
             0,
             0,
-            BAR_WIDTH,
+            bar_width(),
             40,
             Some(msg_hwnd),
             None,
@@ -233,12 +256,13 @@ fn main() -> windows_core::Result<()> {
         } else {
             // 嵌入失败：顶层悬浮在屏幕右下角，保证功能可用
             let (sw, sh) = render::screen_size();
+            let bw = bar_width();
             let _ = WAM::SetWindowPos(
                 bar_hwnd,
                 None,
-                sw - BAR_WIDTH - 8,
+                sw - bw - 8,
                 sh - 60,
-                BAR_WIDTH,
+                bw,
                 28,
                 SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
@@ -312,9 +336,10 @@ fn relayout(bar: HWND) {
             let (y, _unused) = taskbar::tray_left_estimate(parent);
             let _ = taskbar::place(bar, 0, y - bar_h - 4, tb_w, bar_h);
         } else {
+            let bw = bar_width();
             let (x, cy) = taskbar::tray_left_estimate(parent);
             let h = (cy - BAR_HEIGHT_PAD).max(12);
-            let _ = taskbar::place(bar, x - BAR_WIDTH - 6, (cy - h) / 2, BAR_WIDTH, h);
+            let _ = taskbar::place(bar, x - bw - 6, (cy - h) / 2, bw, h);
         }
     }
 }
@@ -852,7 +877,7 @@ fn reembed_if_needed() {
                 WS_CHILD | WS_VISIBLE,
                 0,
                 0,
-                BAR_WIDTH,
+                bar_width(),
                 BAR_HEIGHT_VERTICAL,
                 Some(tb.hwnd),
                 None,

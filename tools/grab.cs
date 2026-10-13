@@ -87,6 +87,17 @@ public class Grab
             : "PostMessageW failed";
     }
 
+    // Post a mouse click at CLIENT coordinates (x packed low, y packed high).
+    public static string ClickAt(string cls, int x, int y)
+    {
+        IntPtr h = Find(cls);
+        if (h == IntPtr.Zero) return "NOT FOUND: " + cls;
+        IntPtr lp = new IntPtr((y << 16) | (x & 0xFFFF));
+        PostMessageW(h, 0x0201, new IntPtr(1), lp); // WM_LBUTTONDOWN
+        PostMessageW(h, 0x0202, IntPtr.Zero, lp);   // WM_LBUTTONUP
+        return "clicked " + cls + " at " + x + "," + y;
+    }
+
     // Park the cursor over the middle of a window (hit-test forwarding path).
     public static string Hover(string cls)
     {

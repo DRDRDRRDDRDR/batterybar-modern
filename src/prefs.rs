@@ -83,6 +83,7 @@ const SECTIONS: &[Section] = &[
             SettingItem::Choice("font_size", "电池条文字字号"),
             SettingItem::Toggle("only_percent_when_charging", "充电时只显示电量百分比"),
             SettingItem::Choice("bar_opacity", "电池条背景不透明度"),
+            SettingItem::Choice("bar_width", "横排电池条宽度"),
             SettingItem::Choice("battery_style", "视觉主题风格"),
         ],
     },
@@ -411,6 +412,9 @@ unsafe fn handle_click(hwnd: HWND, click_y: i32) {
 
     let Some(id) = clicked_id else { return };
     let mut save = false;
+    // 该设置项是否影响条的几何尺寸（宽度/显隐）—— 是则改完必须重新布局，
+    // 光 InvalidateRect 重绘不够：窗口尺寸没变，新宽度不会生效。
+    let mut need_relayout = false;
     {
         let cfg = crate::config_lock();
         let mut c = cfg.lock().unwrap();
@@ -449,6 +453,20 @@ unsafe fn handle_click(hwnd: HWND, click_y: i32) {
                     _ => 100,
                 };
                 save = true;
+            }
+            // 横排条宽度。竖排任务栏下此项无效（条宽必须等于任务栏宽度），
+            // 但仍允许设置 —— 用户换回横排任务栏后即可生效。
+            // 档位 100 → 150 → 200 → 300 → 400 → 100，默认值 150 在循环上。
+            "bar_width" => {
+                c.bar_width = match c.bar_width {
+                    w if w >= 400 => 100,
+                    w if w >= 300 => 400,
+                    w if w >= 200 => 300,
+                    w if w >= 150 => 200,
+                    _ => 150,
+                };
+                save = true;
+                need_relayout = true;
             }
             "battery_style" => {
                 c.battery_style = if c.battery_style == 0 { 1 } else { 0 };
@@ -494,7 +512,7 @@ unsafe fn handle_click(hwnd: HWND, click_y: i32) {
                 c.on_click_mode = if c.on_click_mode == 0 { 1 } else { 0 };
                 save = true;
             }
-            "hide_on_ac" => { c.hide_on_ac = !c.hide_on_ac; save = true; }
+            "hide_on_ac" => { c.hide_on_ac = !c.hide_on_ac; save = true; need_relayout = true; }
             "show_rate_in_tooltip" => { c.show_rate_in_tooltip = !c.show_rate_in_tooltip; save = true; }
             "learn_profiles" => {
                 c.learn_profiles = !c.learn_profiles;
@@ -515,12 +533,17 @@ unsafe fn handle_click(hwnd: HWND, click_y: i32) {
                 // 重置后把学习开关同步回默认值
                 crate::power::LEARN_ENABLED.store(c.learn_profiles, Ordering::Relaxed);
                 crate::set_mode(c.default_mode);
+                need_relayout = true;
             }
             _ => {}
         }
         if save {
             c.save();
         }
+    }
+    // 几何类设置（条宽/显隐）改完必须重新布局，否则窗口尺寸不变、新宽度不生效。
+    if need_relayout {
+        crate::relayout_bar();
     }
     // 注意：不在这里直接执行临界动作（否则点一下选项就关机/睡眠）。
     // 动作只在电量真的掉到临界阈值时由 main.rs::check_notifications 触发。
@@ -665,6 +688,7 @@ fn choice_value(id: &str, c: &Config) -> String {
         },
         "battery_style" => if c.battery_style == 0 { "经典拟物 Aero Glass".into() } else { "现代极简 Fluent".into() },
         "bar_opacity" => format!("{}%", c.bar_opacity),
+        "bar_width" => format!("{} px", c.bar_width),
         "alarm_percent" => if c.alarm_percent == 0 { "关闭".into() } else { format!("{}%", c.alarm_percent) },
         "low_percent" => format!("{}%", c.low_percent),
         "critical_percent" => format!("{}%", c.critical_percent),
