@@ -123,6 +123,19 @@ fn mode_now() -> DisplayMode {
     }
 }
 
+/// 拿当前托盘图标句柄发一条气泡提示。
+///
+/// 供 `prefs.rs` 这类没有托盘上下文的模块在出错时通知用户（例如写注册表
+/// 自启项被拒绝）。托盘未就绪时静默返回 —— 提示失败不该再引发一次失败。
+pub fn tray_balloon(title: &str, text: &str) {
+    let th = TRAY_HWND.load(Ordering::Relaxed);
+    if th == 0 {
+        return;
+    }
+    let t = tray::TrayIcon { hwnd: HWND(th as *mut _) };
+    t.balloon(title, text, windows::Win32::UI::Shell::NIIF_WARNING);
+}
+
 /// 重绘任务栏条（Preferences 改完设置后调用）
 pub fn refresh_bar() {
     let h = BAR_HWND.load(Ordering::Relaxed);
@@ -288,9 +301,12 @@ fn main() -> windows_core::Result<()> {
             };
             set_mode(mode);
             power::LEARN_ENABLED.store(learn, Ordering::Relaxed);
-            // 每次启动把注册表状态对齐到配置（用户可能在外部删过启动项）
+            // 每次启动把注册表状态对齐到配置（用户可能在外部删过启动项）。
+            // 写失败只能记为「未生效」，不改 options.json —— 下次启动会再试。
             let c = cfg.lock().unwrap().clone();
-            c.set_startup(startup);
+            if !c.set_startup(startup) {
+                eprintln!("set_startup: 写入注册表自启项失败（进程完整性级别不足？）");
+            }
         }
 
         // 6) 定时器：1s 变化检测重绘 + 30s 兜底轮询 + 5s Explorer 自愈检查

@@ -188,8 +188,18 @@ impl Config {
         let _ = std::fs::write(config_path(), text);
     }
 
-    /// HKCU\Software\Microsoft\Windows\CurrentVersion\Run 自启开关
-    pub fn set_startup(&self, enable: bool) {
+    /// HKCU\Software\Microsoft\Windows\CurrentVersion\Run 自启开关。
+    ///
+    /// 返回 `true` 表示注册表已按 `enable` 落地。返回 `false` 时必须由调用方
+    /// 回滚配置并告知用户 —— 之前这里把所有错误都吞掉，结果是「开关看着是开
+    /// 的、options.json 里也写着 true，但注册表里根本没有这一项」，属于最难
+    /// 排查的一类静默失败。
+    ///
+    /// 已知失败场景：进程完整性级别低于中等级别（例如 exe 位于带
+    /// `Mandatory Label\Low Mandatory Level` 的目录，由 DSH 文件沙箱标记）
+    /// 时，`RegOpenKeyExW` 对 HKCU 的写入请求会被拒（ACCESS_DENIED，即
+    /// `WIN32_ERROR(5)`）。此时只能如实返回 false。
+    pub fn set_startup(&self, enable: bool) -> bool {
         use windows::Win32::System::Registry::{
             RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
             KEY_READ, KEY_SET_VALUE, REG_SZ,
@@ -202,21 +212,25 @@ impl Config {
             if RegOpenKeyExW(HKEY_CURRENT_USER, sub, None, KEY_READ | KEY_SET_VALUE, &mut hkey)
                 .is_err()
             {
-                return;
+                return false;
             }
             let val: PCWSTR = w!("BatteryBarModern");
-            if enable {
+            let ok = if enable {
                 let path = std::env::current_exe()
                     .map(|p| format!("\"{}\" /minimized", p.display()))
                     .unwrap_or_default();
                 let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
                 // REG_SZ 需要字节视图（含结尾 NUL），字符串本身作为字节序列写入
                 let bytes = std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2);
-                let _ = RegSetValueExW(hkey, val, None, REG_SZ, Some(bytes));
+                RegSetValueExW(hkey, val, None, REG_SZ, Some(bytes)).is_ok()
             } else {
-                let _ = RegDeleteValueW(hkey, val);
-            }
+                // 关闭时「值本来就不存在」等同于成功，不算失败。
+                // ERROR_FILE_NOT_FOUND == WIN32_ERROR(2)
+                let rc = RegDeleteValueW(hkey, val);
+                rc.is_ok() || rc == windows::Win32::Foundation::WIN32_ERROR(2)
+            };
             let _ = RegCloseKey(hkey);
+            ok
         }
     }
 }

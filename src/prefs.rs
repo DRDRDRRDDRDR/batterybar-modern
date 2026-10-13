@@ -425,7 +425,12 @@ unsafe fn handle_click(hwnd: HWND, click_y: i32) {
                 c.run_at_startup = !c.run_at_startup;
                 let en = c.run_at_startup;
                 let c2 = c.clone();
-                c2.set_startup(en);
+                // 注册表写失败必须回滚开关状态，否则 UI 会显示一个实际不存在的自启项。
+                if !c2.set_startup(en) {
+                    c.run_at_startup = !en;
+                    crate::tray_balloon("无法修改开机启动项",
+                        "写入注册表自启项被系统拒绝。若程序位于受限目录，请将 exe 移到普通目录后重试。");
+                }
                 save = true;
             }
             "alternate_on_click" => { c.alternate_on_click = !c.alternate_on_click; save = true; }
