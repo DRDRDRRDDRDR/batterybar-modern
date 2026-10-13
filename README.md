@@ -2,7 +2,7 @@
 
 现代开源版 BatteryBar：把电量条直接嵌进 Windows 10/11 任务栏（横排/竖排任务栏均支持），带系统托盘图标、详情卡片与完整设置面板。Rust + windows-rs 实现，无运行时依赖、无需管理员权限。
 
-![任务栏电量条](shot_v06_skeuo_3x.png)
+![任务栏电量条](shot_v08_bar_skeuo_6x.png)
 
 ## 功能
 
@@ -27,12 +27,19 @@
 - **悬停弹详情卡**：大号百分比 + 状态胶囊 + 电量容量 / 实时功耗 / 满电可用时长 / 电池损耗率 / 供电模式 / 电源计划
 - **设置面板**（双击条或右键菜单 `Preferences...`）六个分组：
   - **常规设置 GENERAL** — 悬停显示详情、满电自动隐藏、开机自启、单击循环切换
-  - **显示与样式 DISPLAY** — 默认显示模式、文字字号（小/中/大）、充电时只显示百分比、背景不透明度、横排电池条宽度（100/150/200/300/400 px）、视觉主题风格
+  - **显示与样式 DISPLAY** — 默认显示模式、文字字号（13/15/17 px）、充电时只显示百分比、背景不透明度、横排电池条宽度（100/150/200/300/400 px）、视觉主题风格
   - **警报与通知 NOTIFICATIONS** — 低电气泡、临界气泡、充满电提示、提示音、自定义电量警报
   - **警告阈值 WARNING LEVELS** — 低电阈值、临界阈值、临界自动动作（睡眠/关机/休眠/重启）
   - **行为 BEHAVIOR** — 左键单击行为、接通电源时隐藏电池条
   - **算法与工具 BATTERY TOOLS** — 详情卡展示实时功耗、全寿命自学习预测、重置放电学习记录、恢复默认设置
 - 设置面板支持滚轮 / 拖动滚动条 / PageUp·PageDown·Home·End 四种滚动方式
+
+### 文字排版
+
+- **字体族显式探测**：`CreateFontW` 对不存在的族**不报错** —— 它返回有效句柄，然后在 `SelectObject` 时静默替换成系统默认字体（实测被换成宋体，衬线点阵，这就是早期版本任务栏文字「很丑」的真因）。程序启动时用 `EnumFontFamiliesExW` 枚举本机已安装族，按 `Segoe UI Variable Text → Segoe UI Variable Small → Segoe UI → Microsoft YaHei UI → Tahoma → Arial` 取第一个真实存在的
+- **负高度字号**：`CreateFontW` 的 `height` 传负值表示字符高度（不含内部行距）。传正值时 11px 的实际字面只有约 7px 高，在任务栏上根本读不清。三档为 13 / 15 / 17 px 字符高度
+- **条高随字号伸缩**：竖排任务栏下条高 = 图标盒 26px + 间隙 + 文字行高。写死高度会在中大字号下把电池图标压成扁块
+- **任务栏条用灰度抗锯齿**：ClearType 的 RGB 亚像素边在深色底 10~12px 字号下会显出橙蓝重影，灰度 AA 干净得多；卡片与面板仍用 ClearType
 
 ### 电源管理
 
@@ -52,9 +59,11 @@
 
 | 金属拟物主题 | 现代极简 Fluent |
 |---|---|
-| ![skeuo](shot_v06_skeuo_3x.png) | ![fluent](shot_v06_fluent_3x.png) |
+| ![skeuo](shot_v08_bar_skeuo_6x.png) | ![fluent](shot_v08_bar_fluent_6x.png) |
 
-![设置面板](shot_v07_prefs_1x.png)
+![状态详情卡](shot_v08_popup_final_2x.png)
+
+![设置面板](shot_v08_prefs_final_1x.png)
 
 ## 构建
 

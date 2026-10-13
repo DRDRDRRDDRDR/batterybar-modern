@@ -52,9 +52,12 @@ const BAR_WIDTH_MIN: i32 = 60;
 /// 横排任务栏下条宽度上限：超过 400 会挤占任务栏按钮区，没有实用价值。
 const BAR_WIDTH_MAX: i32 = 400;
 const BAR_HEIGHT_PAD: i32 = 10;
-/// 竖排任务栏下条的固定高度。46px 是实测下限：再矮就放不下约 1.8:1
-/// 正规比例的电池图标，侧排文字也只剩 ~20px 放不下 "On A/C"。
-const BAR_HEIGHT_VERTICAL: i32 = 46;
+/// 竖排任务栏下条的高度（随字号变化，见 `bar_height_vertical()`）。
+///
+/// 46px 是字号还是 11px 时的实测下限；改用真实 Segoe UI 并正名负高度字号后，
+/// 文字行变高，再按 46px 排就会把电池图标压成 28×16 的扁块（原本约 1.8:1）。
+/// 所以高度必须跟着字号走，保证「图标上 + 文字下」两行都拿到充足行高。
+const BAR_ICON_BOX_V: i32 = 26;
 const TIMER_REFRESH: usize = 1;
 const TIMER_HOVER: usize = 3;
 /// Explorer 重启自愈轮询间隔（ms）。Explorer 崩溃重启后 Shell_TrayWnd 会换新句柄，
@@ -101,6 +104,22 @@ pub fn config_lock() -> &'static Mutex<Config> {
 pub fn bar_width() -> i32 {
     let w = config_lock().lock().unwrap().bar_width;
     w.clamp(BAR_WIDTH_MIN, BAR_WIDTH_MAX)
+}
+
+/// 字号档位（0=小 1=中 2=大）→ 字符高度像素。三档为 13 / 15 / 17。
+///
+/// 纯函数，不读配置 —— `paint_bar` 已持有配置锁，再调读锁函数会自锁死。
+pub fn font_px_of(font_size: u32) -> i32 {
+    13 + (font_size as i32) * 2
+}
+
+/// 竖排任务栏下条高度：图标盒 + 间隙 + 文字行，随字号伸缩。
+///
+/// 高度必须跟着字号走。写死 46px 时，中号字（15px）的文字行要吃 19px，
+/// 留给图标的只剩 16px —— 电池会被压成 28×16 的扁块，完全看不出是电池。
+pub fn bar_height_vertical() -> i32 {
+    let fs = config_lock().lock().unwrap().font_size;
+    BAR_ICON_BOX_V + 9 + (font_px_of(fs) + 4)
 }
 
 pub fn set_mode(m: DisplayMode) {
@@ -249,7 +268,7 @@ fn main() -> windows_core::Result<()> {
             0,
             0,
             bar_width(),
-            40,
+            bar_height_vertical(),
             Some(msg_hwnd),
             None,
             Some(hinstance.into()),
@@ -346,9 +365,8 @@ fn relayout(bar: HWND) {
         let tb_h = trc.bottom - trc.top;
         if tb_h > tb_w {
             // 竖排任务栏：宽度填满任务栏宽度。
-            // 高度 46px 而非 30px —— 30px 塞不下正规比例（约 1.8:1）的电池图标，
-            // 侧排文字也只剩 ~20px 放不下 "On A/C"；46px 可做「图标上 + 文字下」堆叠。
-            let bar_h = BAR_HEIGHT_VERTICAL;
+            // 高度随字号伸缩（见 bar_height_vertical）—— 固定值会把电池图标压扁。
+            let bar_h = bar_height_vertical();
             let (y, _unused) = taskbar::tray_left_estimate(parent);
             let _ = taskbar::place(bar, 0, y - bar_h - 4, tb_w, bar_h);
         } else {
@@ -894,7 +912,7 @@ fn reembed_if_needed() {
                 0,
                 0,
                 bar_width(),
-                BAR_HEIGHT_VERTICAL,
+                bar_height_vertical(),
                 Some(tb.hwnd),
                 None,
                 Some(hinstance.into()),
@@ -1018,23 +1036,24 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
     // 2. 布局：字号档位 0=小 1=中 2=大（Preferences → DISPLAY 可调）
     //    宽条（横排任务栏，≥104px）侧排：图标左 + 文字右
     //    窄条（竖排任务栏 81px）堆叠：图标上 + 文字下（侧排会把文字挤没）
-    let fs = c.font_size as i32;
-    let (icon_l, icon_t, icon_r, icon_b, font_pt, text_mid) = if avail_w >= 104 {
+    let font_px = font_px_of(c.font_size);
+    let (icon_l, icon_t, icon_r, icon_b, text_mid) = if avail_w >= 104 {
         let icon_h = (avail_h - 4).min(30);
         let icon_w = (icon_h * 18) / 10;
         let icon_l = card_l + 2;
         let icon_t = card_t + (avail_h - icon_h) / 2;
         let mid = (card_t + card_b) / 2;
-        (icon_l, icon_t, icon_l + icon_w, icon_t + icon_h, 11 + fs, mid)
+        (icon_l, icon_t, icon_l + icon_w, icon_t + icon_h, mid)
     } else {
-        let text_h = 12 + fs * 2;
-        let icon_h = (avail_h - text_h - 5).clamp(12, 24);
+        // 81px 宽的竖排任务栏：图标上、文字下。条高由 bar_height_vertical() 保证
+        // 图标盒有 BAR_ICON_BOX_V 的空间，这里不再压缩图标（压了会变扁块）。
+        let icon_h = BAR_ICON_BOX_V;
         let icon_w = ((icon_h * 18) / 10).min(avail_w - 8);
         let icon_l = card_l + (avail_w - icon_w) / 2;
         let icon_t = card_t + 1;
         let icon_b = icon_t + icon_h;
         let text_mid = (icon_b + card_b) / 2;
-        (icon_l, icon_t, icon_l + icon_w, icon_b, 9 + fs, text_mid)
+        (icon_l, icon_t, icon_l + icon_w, icon_b, text_mid)
     };
 
     // 3. 拟物化实体电池（金属外壳 + 正极端子 + 内凹观察窗 + 电解液液面）
@@ -1071,10 +1090,11 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
     }
 
     // 4. 文字：灰度抗锯齿 + Telegram 单色。文字只落在任务栏底色上（不压电池），
-    //    对比度已足够，不需要浮雕底衬——10px 字号下 1px 暗影会变成脏重影。
+    //    对比度已足够，不需要浮雕底衬——小字号下 1px 暗影会变成脏重影。
     if !text.is_empty() {
         let mut buf: Vec<u16> = text.encode_utf16().collect();
-        let font = render::create_ui_font_gray(font_pt, 600);
+        // 负高度 = 字符高度（不含内部行距），见 render::create_ui_font 的说明。
+        let font = render::create_ui_font_gray(-font_px, 600);
         let old_font = SelectObject(hdc, font.into());
 
         let mut size = windows::Win32::Foundation::SIZE::default();

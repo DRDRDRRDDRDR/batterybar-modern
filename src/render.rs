@@ -7,12 +7,12 @@
 // 5. 几何：连续平滑曲线药丸卡片 (Smooth Floating Pill)，摒弃粗陋切线与硬突起。
 #![allow(non_snake_case)]
 
-use windows::Win32::Foundation::{COLORREF, RECT};
+use windows::Win32::Foundation::{COLORREF, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, FillRect, RoundRect, SelectObject,
-    SetBkMode, ANTIALIASED_QUALITY, FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION,
-    FONT_QUALITY, HDC, HFONT, HGDIOBJ, TRANSPARENT, PS_SOLID, GetStockObject, HOLLOW_BRUSH,
-    NULL_PEN,
+    CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, EnumFontFamiliesExW, FillRect,
+    GetDC, ReleaseDC, RoundRect, SelectObject, SetBkMode, ANTIALIASED_QUALITY,
+    FONT_CHARSET, FONT_CLIP_PRECISION, FONT_OUTPUT_PRECISION, FONT_QUALITY, HDC, HFONT, HGDIOBJ,
+    LOGFONTW, TEXTMETRICW, TRANSPARENT, PS_SOLID, GetStockObject, HOLLOW_BRUSH, NULL_PEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
 
@@ -577,7 +577,75 @@ pub unsafe fn draw_charge_bolt(hdc: HDC, cx: i32, cy: i32, h: i32, w: i32, color
     SelectObject(hdc, old_p);
 }
 
-/// 创建高质量 UI 字体：Segoe UI Variable Text / Segoe UI（ClearType 亚像素）
+/// UI 字体族的候选优先级。取第一个**实际已安装**的。
+///
+/// "Segoe UI Variable Text" 只在较新的 Windows 11 版本（带 Segoe UI Variable
+/// 可变字体）上存在。本机没有这个族，而 `CreateFontW` 对不存在的族**不报错**
+/// —— 它返回一个有效句柄，然后在 `SelectObject` 时静默替换成系统默认字体。
+/// 实测被替换成**宋体**（衬线点阵），这就是任务栏条文字看起来很丑的原因。
+/// 所以必须显式枚举已安装族来判断，`HFONT::is_invalid()` 兜底永远不会触发。
+const FACE_PREFS: [&str; 6] = [
+    "Segoe UI Variable Text",
+    "Segoe UI Variable Small",
+    "Segoe UI",
+    "Microsoft YaHei UI",
+    "Tahoma",
+    "Arial",
+];
+
+static UI_FACE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 已解析的 UI 字体族名（进程内只枚举一次）。
+pub fn ui_face() -> &'static str {
+    UI_FACE.get_or_init(|| {
+        let names = unsafe { collect_font_families() };
+        for want in FACE_PREFS {
+            if names.iter().any(|n| n.eq_ignore_ascii_case(want)) {
+                return want.to_string();
+            }
+        }
+        // 全都不在（理论上不可能）时才退回最常见的族。
+        "Segoe UI".to_string()
+    })
+}
+
+/// 枚举本机所有 GDI 字体族名。
+unsafe fn collect_font_families() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let hdc = GetDC(None);
+    if hdc.0.is_null() {
+        return out;
+    }
+    let mut lf: LOGFONTW = std::mem::zeroed();
+    lf.lfCharSet = DEFAULT_CHARSET();
+
+    unsafe extern "system" fn cb(
+        lf: *const LOGFONTW,
+        _tm: *const TEXTMETRICW,
+        _ft: u32,
+        lp: LPARAM,
+    ) -> i32 {
+        let v = &mut *(lp.0 as *mut Vec<String>);
+        let p = (*lf).lfFaceName.as_ptr();
+        let len = (0..32).position(|i| *p.add(i) == 0).unwrap_or(32);
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p, len));
+        // 以 '@' 开头的族是竖排变体，跳过
+        if !s.is_empty() && !s.starts_with('@') && !v.iter().any(|x| x == &s) {
+            v.push(s);
+        }
+        1 // 继续枚举
+    }
+
+    let lp = LPARAM(&mut out as *mut Vec<String> as isize);
+    let _ = EnumFontFamiliesExW(hdc, &lf, Some(cb), lp, 0);
+    let _ = ReleaseDC(None, hdc);
+    out
+}
+
+/// 创建高质量 UI 字体：已安装的最佳族 + 灰度抗锯齿。
+///
+/// `height_px` 传**负值**表示字符高度（不含内部行距），正值表示单元格高度。
+/// 界面文字一律用负值 —— 正值会让小字号被内部行距吃掉，字面明显偏小。
 pub fn create_ui_font(height_px: i32, weight: i32) -> HFONT {
     create_ui_font_q(height_px, weight, CLEARTYPE_QUALITY())
 }
@@ -591,8 +659,8 @@ pub fn create_ui_font_gray(height_px: i32, weight: i32) -> HFONT {
 
 fn create_ui_font_q(height_px: i32, weight: i32, quality: FONT_QUALITY) -> HFONT {
     unsafe {
-        let face: windows_core::HSTRING = "Segoe UI Variable Text".into();
-        let h = CreateFontW(
+        let face: windows_core::HSTRING = ui_face().into();
+        CreateFontW(
             height_px,
             0,
             0,
@@ -607,28 +675,7 @@ fn create_ui_font_q(height_px: i32, weight: i32, quality: FONT_QUALITY) -> HFONT
             quality,
             0,
             windows_core::PCWSTR::from_raw(face.as_ptr()),
-        );
-        if h.is_invalid() {
-            let fallback: windows_core::HSTRING = "Segoe UI".into();
-            CreateFontW(
-                height_px,
-                0,
-                0,
-                0,
-                weight,
-                0,
-                0,
-                0,
-                DEFAULT_CHARSET(),
-                OUT_DEFAULT_PRECIS(),
-                CLIP_DEFAULT_PRECIS(),
-                quality,
-                0,
-                windows_core::PCWSTR::from_raw(fallback.as_ptr()),
-            )
-        } else {
-            h
-        }
+        )
     }
 }
 

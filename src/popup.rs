@@ -116,11 +116,12 @@ pub fn toggle_popup() {
 
         let _ = POPUP_BOX.set(PopupBox(Popup {
             palette,
-            font_hero: render::create_ui_font(28, 700),
-            font_sub: render::create_ui_font(12, 500),
-            font_title: render::create_ui_font(14, 600),
-            font_key: render::create_ui_font(12, 400),
-            font_val: render::create_ui_font(12, 600),
+            // 负高度 = 字符高度（不含内部行距）；与 prefs.rs 同理。
+            font_hero: render::create_ui_font(-42, 700),
+            font_sub: render::create_ui_font(-13, 500),
+            font_title: render::create_ui_font(-16, 600),
+            font_key: render::create_ui_font(-14, 400),
+            font_val: render::create_ui_font(-14, 600),
         }));
 
         let pref = DWMWCP_ROUND.0;
@@ -232,30 +233,32 @@ unsafe fn paint_popup(p: &Popup, hdc: HDC) {
     SetTextColor(hdc, pal.text);
     SelectObject(hdc, p.font_title.into());
     let mut title: Vec<u16> = "BatteryBar Modern".encode_utf16().collect();
-    let mut trc = RECT { left: 52, top: 12, right: POPUP_W - 16, bottom: 30 };
-    DrawTextW(hdc, &mut title, &mut trc, DT_NOPREFIX | DT_SINGLELINE);
+    // 标题与副标题各给足行高：-16 / -13 的字符高度分别需要约 19px / 16px。
+    let mut trc = RECT { left: 52, top: 8, right: POPUP_W - 16, bottom: 30 };
+    DrawTextW(hdc, &mut title, &mut trc, DT_NOPREFIX | DT_SINGLELINE | windows::Win32::Graphics::Gdi::DT_VCENTER);
 
     SetTextColor(hdc, pal.text_dim);
     SelectObject(hdc, p.font_sub.into());
     let mut sub: Vec<u16> = "Windows 11 Battery Monitor".encode_utf16().collect();
-    let mut ssubrc = RECT { left: 52, top: 28, right: POPUP_W - 16, bottom: 44 };
-    DrawTextW(hdc, &mut sub, &mut ssubrc, DT_NOPREFIX | DT_SINGLELINE);
+    let mut ssubrc = RECT { left: 52, top: 30, right: POPUP_W - 16, bottom: 48 };
+    DrawTextW(hdc, &mut sub, &mut ssubrc, DT_NOPREFIX | DT_SINGLELINE | windows::Win32::Graphics::Gdi::DT_VCENTER);
 
     // 2. 核心大数字 Hero Card
     let hero_l = 16;
     let hero_t = 50;
     let hero_r = POPUP_W - 16;
-    let hero_b = 120;
+    let hero_b = 126;
     render::fill_round(hdc, hero_l, hero_t, hero_r, hero_b, 10, pal.surface_dim);
     render::stroke_round(hdc, hero_l, hero_t, hero_r, hero_b, 10, pal.border);
 
-    // 大号数字
+    // 大号数字。字号是字符高度（负值），必须留够行高再用 DT_VCENTER 垂直居中 ——
+    // 否则矩形比字面矮，DrawTextW 会直接裁掉上下半截。
     SetTextColor(hdc, pal.text);
     SelectObject(hdc, p.font_hero.into());
     let hero_text = if pct < 0 { "—".to_string() } else { format!("{}%", pct) };
     let mut hbuf: Vec<u16> = hero_text.encode_utf16().collect();
-    let mut hrc = RECT { left: hero_l, top: hero_t + 10, right: hero_r, bottom: hero_t + 44 };
-    DrawTextW(hdc, &mut hbuf, &mut hrc, DT_NOPREFIX | DT_SINGLELINE | windows::Win32::Graphics::Gdi::DT_CENTER);
+    let mut hrc = RECT { left: hero_l, top: hero_t + 4, right: hero_r, bottom: hero_t + 56 };
+    DrawTextW(hdc, &mut hbuf, &mut hrc, DT_NOPREFIX | DT_SINGLELINE | windows::Win32::Graphics::Gdi::DT_CENTER | windows::Win32::Graphics::Gdi::DT_VCENTER);
 
     // 状态小徽章
     let status_str = if charging {
@@ -266,8 +269,8 @@ unsafe fn paint_popup(p: &Popup, hdc: HDC) {
     SetTextColor(hdc, if charging { pal.accent_blue } else if pct <= 20 { pal.accent_warn } else { pal.accent_green });
     SelectObject(hdc, p.font_sub.into());
     let mut stbuf: Vec<u16> = status_str.encode_utf16().collect();
-    let mut strc = RECT { left: hero_l, top: hero_t + 46, right: hero_r, bottom: hero_b - 6 };
-    DrawTextW(hdc, &mut stbuf, &mut strc, DT_NOPREFIX | DT_SINGLELINE | windows::Win32::Graphics::Gdi::DT_CENTER);
+    let mut strc = RECT { left: hero_l, top: hero_t + 58, right: hero_r, bottom: hero_b - 4 };
+    DrawTextW(hdc, &mut stbuf, &mut strc, DT_NOPREFIX | DT_SINGLELINE | windows::Win32::Graphics::Gdi::DT_CENTER | windows::Win32::Graphics::Gdi::DT_VCENTER);
 
     // 3. 分组列表（Grouped Cells）
     let draw_cell_group = |start_y: i32, rows: &[(&str, String, Option<windows::Win32::Foundation::COLORREF>)]| -> i32 {

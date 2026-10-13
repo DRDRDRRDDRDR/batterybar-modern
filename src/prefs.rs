@@ -244,9 +244,12 @@ pub fn toggle_prefs() {
 
         let _ = PREFS_BOX.set(PrefsBox(Prefs {
             palette,
-            font_section: render::create_ui_font(12, 600),
-            font_label: render::create_ui_font(13, 500),
-            font_value: render::create_ui_font(13, 600),
+            // 负高度 = 字符高度（不含内部行距）。改用真实 Segoe UI 后，正的
+            // 单元格高度会让字面明显偏小（Segoe UI 的内部行距比原先被替换的
+            // 点阵字体大得多），所以这里统一改负值。
+            font_section: render::create_ui_font(-14, 600),
+            font_label: render::create_ui_font(-15, 500),
+            font_value: render::create_ui_font(-15, 600),
         }));
 
         let pref = DWMWCP_ROUND.0;
@@ -448,6 +451,9 @@ unsafe fn handle_click(hwnd: HWND, click_y: i32) {
             "font_size" => {
                 c.font_size = (c.font_size + 1) % 3;
                 save = true;
+                // 竖排任务栏的条高由字号决定（见 bar_height_vertical），
+                // 改字号必须重跑 relayout，否则文字行会被裁掉。
+                need_relayout = true;
             }
             "only_percent_when_charging" => { c.only_percent_when_charging = !c.only_percent_when_charging; save = true; }
             "bar_opacity" => {
@@ -687,9 +693,9 @@ fn choice_value(id: &str, c: &Config) -> String {
             DisplayMode::Icon => "小图标模式".into(),
         },
         "font_size" => match c.font_size {
-            0 => "小 10pt".into(),
-            1 => "中 12pt".into(),
-            _ => "大 14pt".into(),
+            0 => "小 13px".into(),
+            1 => "中 15px".into(),
+            _ => "大 17px".into(),
         },
         "battery_style" => if c.battery_style == 0 { "经典拟物 Aero Glass".into() } else { "现代极简 Fluent".into() },
         "bar_opacity" => format!("{}%", c.bar_opacity),
