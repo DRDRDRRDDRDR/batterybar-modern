@@ -1,6 +1,6 @@
 # BatteryBar Modern
 
-现代开源版 BatteryBar：把电量条直接嵌进 Windows 10/11 任务栏，横排与竖排任务栏都支持，并复刻原版 BatteryBar Pro 的完整功能面 —— 独立电池曲线窗口、六分类设置面板、七字段状态详情卡。Rust + windows-rs 实现，无运行时依赖、无需管理员权限。
+现代开源版 BatteryBar：把电量条直接嵌进 Windows 10/11 任务栏，横排与竖排任务栏都支持，并复刻原版 BatteryBar Pro 的完整功能面 —— 独立电池曲线窗口、六分类设置面板、七字段状态详情卡、外部 `theme.xml` 主题包。Rust + windows-rs 实现，无运行时依赖、无需管理员权限。
 
 ![任务栏电量条](shot_v09_bar_6x.png)
 
@@ -45,20 +45,45 @@
 | 分类 | 内容 |
 |---|---|
 | 通用 General | 状态提示卡、统计式时间估算、按电源计划分档案、备用电池 ID 判定、满电自动隐藏、强制速率估算、开机自启 |
-| 显示 Display | 工具栏显示项勾选、默认显示项、单击轮播、充电时只显示百分比、双电池独立弹窗、详情卡显示电池 ID、字号、百分比精度、主题、文字阴影、背景不透明度、横排条宽、单击行为、接通电源隐藏 |
+| 显示 Display | 工具栏显示项勾选、默认显示项、单击轮播、充电时只显示百分比、双电池独立弹窗、详情卡显示电池 ID、字号、百分比精度、主题与外部主题选择、文字阴影、背景不透明度、横排条宽、单击行为、接通电源隐藏 |
 | 通知 Notifications | Critical / Low / Finished charging 三组事件，每组都有音频提示、弹窗、自定义音频、主板蜂鸣、运行外部程序 |
 | 警告阈值 Warning Levels | 按百分比或按剩余时间定义、低电量与临界阈值、Soft minimum、Full battery level、额外自定义警报阈值、临界自动动作 |
 | 电源 Power Saving | 电池供电与接通电源两种情形分别设定切换电源计划、电池时禁用 Aero、仅在低于指定百分比时生效 |
-| 工具 Tools | 打开曲线窗口、清空曲线数据、记录 BatteryStatus.log、详情卡显示实时功耗、重置学习历史、恢复默认、打开程序目录 |
+| 工具 Tools | 打开曲线窗口、清空曲线数据、记录 BatteryStatus.log、详情卡显示实时功耗、重置学习历史、打开主题文件夹、重新扫描外部主题、恢复默认、打开程序目录 |
 
 支持滚轮、拖动滚动条、`PageUp` `PageDown` `Home` `End`、数字键 `1`–`6` 切换到指定分类。
 
-### 两套视觉主题
+### 视觉主题
 
-- **金属拟物**，默认主题：6 段金属渐变外壳 + 正极端子 + 内凹观察窗井 + 电解液液面，液面由双层色 + 弯月线 + 柔光斑 + 底部反光带构成，端子与壳体共用一条外轮廓
+三种来源，在设置面板的「主题 Theme」里一键切换：
+
+- **金属拟物**，默认：6 段金属渐变外壳 + 正极端子 + 内凹观察窗井 + 电解液液面，液面由双层色 + 弯月线 + 柔光斑 + 底部反光带构成，端子与壳体共用一条外轮廓
 - **现代极简 Fluent**：扁平圆角轨道 + 蓝色填充条 + 细端子
+- **外部主题**：读取原版 BatteryBar 的 `theme.xml` 主题包，可安装现成的第三方主题
 
-在设置面板的「主题 Theme」里一键切换。
+外部主题放在 exe 同目录的 `themes\` 下，一个子目录一个主题，目录里放 `theme.xml`：
+
+```
+themes\
+  W10Dark\
+    theme.xml
+    Background\  Charging\  Discharging\  ...
+  W10Light\
+    theme.xml
+    ...
+```
+
+`theme.xml` 的结构与原版一致：
+
+- 根节点 `<Theme>`，元数据有 `<Name>` `<Author>` `<Version>` `<MaxHeight>`
+- `<States>` 内含五个状态：`Default` `Discharging` `LowBattery` `CriticalBattery` `Charging`
+- 每个状态可定义 `Font` `TextColor` `TextShadow` `Padding` `Background` `ProgressBar` `HoverOverlay` `PressedOverlay`
+- 每个图层要么给单张 `Center` 整体拉伸，要么给四角加四边的九宫格，两种情况都支持
+- `TextColor` 写三个数表示 RGB，写四个数且末位为 0 表示该状态不显示文字
+- `MaxHeight` 是该主题按像素设计的基准高度，实际渲染按任务栏条高自动等比缩放，因此同一个主题在横排与竖排任务栏下都合体
+- 路径用反斜杠，相对 `theme.xml` 所在目录
+
+程序启动时扫描一次，在设置面板「工具 Tools」页有「打开主题文件夹」与「重新扫描外部主题」两个动作，装完主题不必重启。
 
 ### 电源管理
 
@@ -81,9 +106,15 @@
 |---|---|
 | ![skeuo](shot_v09_bar_6x.png) | ![fluent](shot_v09_bar_fluent_6x.png) |
 
+| 外部主题 · W10 Dark | 外部主题 · W10 Light |
+|---|---|
+| ![w10 dark](shot_v10_theme_w10dark_6x.png) | ![w10 light](shot_v10_theme_w10light_6x.png) |
+
 ![状态详情卡](shot_v09_popup_2x.png)
 
 ![设置面板](shot_v09_prefs_1x.png)
+
+![设置面板 · 主题选择](shot_v10_prefs_theme_1x.png)
 
 | 电池曲线窗口 · 放电 | 电池曲线窗口 · 充电 |
 |---|---|
@@ -124,6 +155,8 @@ cargo build --release
 - 背景不透明度低于 100% 时，合成结果取决于任务栏自身的 Acrylic 状态
 - **「横排电池条宽度」只在横排任务栏生效**：竖排任务栏下条宽必须等于任务栏宽度，否则会露出缝，程序会忽略该设置
 - **曲线需要时间积累**：放电与充电曲线各自独立记录，刚装上时打开窗口只会看到空态提示，属正常现象
+- **外部主题只解析 `theme.xml`**：原版部分主题用 `.theme` 打包格式，本版只认目录式的 `theme.xml`；把主题包解压到 `themes\<名字>\` 即可
+- **外部主题的字体作用于条上文字**：主题里 `<Font>` 指定的族若本机没装，会静默落到系统默认字体，与原版行为相同
 - **开机自启需要普通目录**：自启项写在 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，该键要求中完整性级别。若 exe 位于被标记为低完整性级别的目录，例如受沙箱管控的目录，写注册表会被系统拒绝，此时设置面板会提示并把开关回滚为关闭。把 exe 移到普通目录即可正常使用
 
 ## License

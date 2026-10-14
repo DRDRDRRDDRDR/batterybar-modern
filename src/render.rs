@@ -651,10 +651,39 @@ pub fn create_ui_font(height_px: i32, weight: i32) -> HFONT {
 }
 
 /// 同上，但用灰度抗锯齿。任务栏条上的文字落在深色底上，ClearType 的 RGB 亚像素
-/// 边会在 10~12px 字号下显出彩边（实测截图里 "On A/C" 呈橙蓝重影），
+/// 边会在 10~12px 字号下显出彩边，实测截图里 "On A/C" 呈橙蓝重影，
 /// 灰度 AA 在深底上干净得多。
 pub fn create_ui_font_gray(height_px: i32, weight: i32) -> HFONT {
     create_ui_font_q(height_px, weight, ANTIALIASED_QUALITY)
+}
+
+/// 用指定字体族创建字体。外部 theme.xml 主题自带 Font Name 与 Size，走这条路径。
+/// 族名不存在时 CreateFontW 不会报错，而是在选入时静默替换成系统默认字体，
+/// 因此调用方应当先确认族名确实存在，见 ui_face 的枚举逻辑。
+pub fn create_font_face(face: &str, height_px: i32, weight: i32) -> HFONT {
+    let chosen: windows_core::HSTRING = if face.is_empty() {
+        ui_face().into()
+    } else {
+        face.into()
+    };
+    unsafe {
+        CreateFontW(
+            height_px,
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET(),
+            OUT_DEFAULT_PRECIS(),
+            CLIP_DEFAULT_PRECIS(),
+            ANTIALIASED_QUALITY,
+            0,
+            windows_core::PCWSTR::from_raw(chosen.as_ptr()),
+        )
+    }
 }
 
 fn create_ui_font_q(height_px: i32, weight: i32, quality: FONT_QUALITY) -> HFONT {

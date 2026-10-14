@@ -23,16 +23,18 @@ mod prefs;
 mod profile;
 mod render;
 mod taskbar;
+mod theme;
 mod tray;
 
 use std::sync::atomic::Ordering;
 use std::sync::{Mutex, OnceLock};
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, DrawTextW, EndPaint, InvalidateRect, DT_NOPREFIX, DT_SINGLELINE, PAINTSTRUCT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
 };
@@ -99,6 +101,14 @@ static REFRESH_MSG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32:
 static LAST_SIG: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(i64::MIN);
 static DISPLAY_MODE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0); // 0=time 1=percent 2=rate 3=capacity 4=icon
 static HOVER_TRACKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 鼠标左键是否正压在条上。外部主题的 PressedOverlay 层用它决定是否绘制。
+static PRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 条窗口当前 DPI。外部主题的字号单位是 pt，换算成像素需要这个值。
+static DPI: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(96);
+
+fn pressed_now() -> bool {
+    PRESSED.load(Ordering::Relaxed)
+}
 
 static CONFIG: OnceLock<Mutex<Config>> = OnceLock::new();
 
@@ -375,6 +385,9 @@ fn main() -> windows_core::Result<()> {
         let _ = SetTimer(Some(msg_hwnd), TRAY_TIMER, TRAY_POLL_MS, None);
         let _ = SetTimer(Some(msg_hwnd), TIMER_REEMBED, REEMBED_MS, None);
 
+        // 6.5) 扫描外部 theme.xml 主题，供主题下拉使用
+        theme::reload();
+
         // 7) 支持命令行直接打开设置面板 / 曲线窗口
         //    batterybar-modern.exe --prefs            打开 Preferencges
         //    batterybar-modern.exe --prefs=tools      打开并直接跳到 Tools 分类页
@@ -399,6 +412,9 @@ fn main() -> windows_core::Result<()> {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
+
+        // 9) 释放 GDI+ —— 外部主题的贴图解码依赖它
+        theme::shutdown();
     }
     Ok(())
 }
@@ -446,13 +462,22 @@ unsafe extern "system" fn bar_wndproc(
         WAM::WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(hwnd, &mut ps);
+            // 外部主题的字号单位是 pt，需要按条窗口的 DPI 换算成像素
+            DPI.store(GetDpiForWindow(hwnd) as i32, Ordering::Relaxed);
             let mut client_rc = RECT::default();
             let _ = WAM::GetClientRect(hwnd, &mut client_rc);
             paint_bar(hdc, &client_rc);
             let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
+        WAM::WM_LBUTTONDOWN => {
+            // 外部主题的 PressedOverlay 层在此刻点亮，松开时熄灭
+            PRESSED.store(true, Ordering::Relaxed);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            LRESULT(0)
+        }
         WAM::WM_LBUTTONUP => {
+            PRESSED.store(false, Ordering::Relaxed);
             // 原版行为：点击在 时间剩余 / 百分比 / 功率速率 / 剩余容量 / 仅图标 之间循环切换。
             // Preferences → BEHAVIOR →「单击行为」可改为直接弹详情卡。
             let cfg = config_lock();
@@ -502,8 +527,10 @@ unsafe extern "system" fn bar_wndproc(
         }
         0x02A2 /* WM_MOUSELEAVE */ => {
             HOVER_TRACKED.store(false, Ordering::Relaxed);
+            PRESSED.store(false, Ordering::Relaxed);
             let _ = KillTimer(Some(hwnd), TIMER_HOVER);
             popup::close_popup();
+            let _ = InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
         WAM::WM_TIMER => {
@@ -1136,44 +1163,137 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
         (icon_l, icon_t, icon_l + icon_w, icon_b, text_mid)
     };
 
-    // 3. 拟物化实体电池（金属外壳 + 正极端子 + 内凹观察窗 + 电解液液面）
-    //    或现代极简 Fluent（扁平轨道 + 圆角填充条），由 Preferences 的视觉主题风格决定
+    // 3. 三种电池外观，由 Preferences 的视觉主题风格决定：
+    //    风格 0 = 拟物化实体电池，金属外壳 + 正极端子 + 内凹观察窗 + 电解液液面
+    //    风格 1 = 现代极简 Fluent，扁平轨道 + 圆角填充条
+    //    风格 2 = 外部 theme.xml 主题，走完全不同的贴图路径
     let low = pct <= c.low_percent;
     let critical = pct <= c.critical_percent;
-    render::draw_battery_icon(
-        hdc,
-        icon_l,
-        icon_t,
-        icon_r,
-        icon_b,
-        pct,
-        charging,
-        low,
-        critical,
-        c.battery_style,
-        &pal,
-    );
 
-    // 充电时在观察窗内叠加拟物闪电（7x7 像素掩码最近邻缩放，小尺寸不糊）
-    if charging {
-        let side = ((icon_b - icon_t) * 58) / 100;
-        if side >= 5 {
-            render::draw_charge_bolt(
-                hdc,
-                (icon_l + icon_r) / 2,
-                (icon_t + icon_b) / 2,
-                side,
-                side,
-                render::lighten(pal.accent_blue, 0.74),
+    let hovered = HOVER_TRACKED.load(Ordering::Relaxed);
+    let pressed = pressed_now();
+
+    // 外部主题的绘制顺序为 背景图 → 进度条图 → 悬停层或按下层。
+    // 主题缺图或没装主题时返回 false，回退到内置画法。
+    let mut theme_text: Option<(String, i32, bool, COLORREF, [i32; 4], bool)> = None;
+    let mut themed = false;
+    if c.battery_style == 2 {
+        let st = theme::RenderState {
+            pct,
+            charging,
+            low,
+            critical,
+            hovered,
+            pressed,
+        };
+        themed = theme::draw_with_theme(hdc, *rc, &st, c.theme_index as usize);
+        if themed {
+            let dpi = DPI.load(Ordering::Relaxed);
+            theme_text = theme::text_style(
+                c.theme_index as usize,
+                charging,
+                low,
+                critical,
+                rc.bottom - rc.top,
+                dpi,
             );
         }
     }
 
-    // 4. 文字：灰度抗锯齿 + Telegram 单色。文字只落在任务栏底色上（不压电池），
-    //    对比度已足够，不需要浮雕底衬——小字号下 1px 暗影会变成脏重影。
-    if !text.is_empty() {
+    if !themed {
+        render::draw_battery_icon(
+            hdc,
+            icon_l,
+            icon_t,
+            icon_r,
+            icon_b,
+            pct,
+            charging,
+            low,
+            critical,
+            c.battery_style,
+            &pal,
+        );
+
+        // 充电时在观察窗内叠加拟物闪电，7x7 像素掩码最近邻缩放，小尺寸不糊
+        if charging {
+            let side = ((icon_b - icon_t) * 58) / 100;
+            if side >= 5 {
+                render::draw_charge_bolt(
+                    hdc,
+                    (icon_l + icon_r) / 2,
+                    (icon_t + icon_b) / 2,
+                    side,
+                    side,
+                    render::lighten(pal.accent_blue, 0.74),
+                );
+            }
+        }
+    }
+
+    // 4. 文字：灰度抗锯齿 + Telegram 单色。文字只落在任务栏底色上，不压电池，
+    //    对比度已足够，不需要浮雕底衬，小字号下 1px 暗影会变成脏重影。
+    //    外部主题若给出自己的文字样式与内边距，则按主题来画。
+    if let Some((face, px, bold, color, pad, shadow)) = theme_text {
+        if !text.is_empty() {
+            let mut buf: Vec<u16> = text.encode_utf16().collect();
+
+            // Padding 顺序为 左 上 右 下，相对条高缩放后作为文字矩形的内缩量
+            let drc_text = RECT {
+                left: rc.left + pad[0],
+                top: rc.top + pad[1],
+                right: rc.right - pad[2],
+                bottom: rc.bottom - pad[3],
+            };
+            let avail = (drc_text.right - drc_text.left).max(1);
+
+            // 主题字号按条高缩放后常常放不下：窄条上 10pt 会被放大成 30px，
+            // 而 "On A/C" 在 81px 宽的条里根本排不开。这里逐档收字号直到能放下，
+            // 下限 8px 以免小到不可读。
+            let mut fit = px.clamp(8, 40);
+            loop {
+                let f = render::create_font_face(&face, -fit, if bold { 700 } else { 400 });
+                let old = SelectObject(hdc, f.into());
+                let mut size = windows::Win32::Foundation::SIZE::default();
+                let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
+                SelectObject(hdc, old);
+                let _ = DeleteObject(f.into());
+                if size.cx <= avail || fit <= 8 {
+                    break;
+                }
+                fit -= 1;
+            }
+
+            let font = render::create_font_face(&face, -fit, if bold { 700 } else { 400 });
+            let old_font = SelectObject(hdc, font.into());
+            let mut size = windows::Win32::Foundation::SIZE::default();
+            let _ = GetTextExtentPoint32W(hdc, &buf, &mut size);
+
+            let mut drc_text = drc_text;
+            if drc_text.bottom - drc_text.top < size.cy + 2 {
+                let mid = (drc_text.top + drc_text.bottom) / 2;
+                drc_text.top = mid - size.cy / 2 - 1;
+                drc_text.bottom = mid + size.cy / 2 + 1;
+            }
+            let flags = DT_NOPREFIX | DT_SINGLELINE | windows::Win32::Graphics::Gdi::DT_VCENTER;
+            if shadow {
+                let mut drop = drc_text;
+                drop.left += 1;
+                drop.top += 1;
+                drop.right += 1;
+                drop.bottom += 1;
+                SetTextColor(hdc, render::darken(color, 0.65));
+                DrawTextW(hdc, &mut buf, &mut drop, flags);
+            }
+            SetTextColor(hdc, color);
+            DrawTextW(hdc, &mut buf, &mut drc_text, flags);
+
+            SelectObject(hdc, old_font);
+            let _ = DeleteObject(font.into());
+        }
+    } else if !text.is_empty() {
         let mut buf: Vec<u16> = text.encode_utf16().collect();
-        // 负高度 = 字符高度（不含内部行距），见 render::create_ui_font 的说明。
+        // 负高度 = 字符高度，不含内部行距，见 render::create_ui_font 的说明
         let font = render::create_ui_font_gray(-font_px, 600);
         let old_font = SelectObject(hdc, font.into());
 

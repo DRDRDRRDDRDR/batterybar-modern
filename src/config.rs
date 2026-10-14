@@ -64,7 +64,9 @@ pub struct Config {
     pub show_battery_id: bool, // Display the battery ID in the status popup
     pub font_size: u32, // BatteryBar font 字号档：0=小 1=中 2=大
     pub percent_precision: u32, // Percentage precision：小数位数 0/1/2
-    pub battery_style: u32, // Theme：0=经典拟物 Aero Glass, 1=现代 Fluent
+    pub battery_style: u32, // Theme：0=经典拟物 Aero Glass, 1=现代 Fluent, 2=外部 theme.xml
+    /// 外部主题在 themes 目录里的序号，配合 battery_style == 2 使用
+    pub theme_index: u32,
     pub text_shadow: bool, // 条上文字是否绘制 1px 阴影
     pub bar_width: i32, // 横排电池条宽度（px）
     pub bar_opacity: i32, // 条背景不透明度 0..=100
@@ -158,6 +160,7 @@ impl Default for Config {
             font_size: 1,
             percent_precision: 1,
             battery_style: 0,
+            theme_index: 0,
             text_shadow: false,
             bar_width: 150,
             bar_opacity: 100,
@@ -198,6 +201,13 @@ fn config_path() -> PathBuf {
     let mut p = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     p.pop();
     p.push("options.json");
+    p
+}
+
+/// exe 所在目录。配置、采样、日志与主题都放在这里。
+pub fn exe_dir() -> PathBuf {
+    let mut p = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    p.pop();
     p
 }
 
@@ -258,7 +268,8 @@ impl Config {
                 "show_battery_id" => c.show_battery_id = as_bool(v),
                 "font_size" => c.font_size = v.parse().unwrap_or(1).min(2),
                 "percent_precision" => c.percent_precision = v.parse().unwrap_or(1).min(2),
-                "battery_style" | "theme" => c.battery_style = v.parse().unwrap_or(0).min(3),
+                "battery_style" | "theme" => c.battery_style = v.parse().unwrap_or(0).min(2),
+                "theme_index" => c.theme_index = v.parse().unwrap_or(0),
                 "text_shadow" => c.text_shadow = as_bool(v),
                 "bar_width" => c.bar_width = v.parse().unwrap_or(150).clamp(60, 400),
                 "bar_opacity" => c.bar_opacity = v.parse().unwrap_or(100).clamp(0, 100),
@@ -347,6 +358,7 @@ impl Config {
                 "  \"font_size\": {},\n",
                 "  \"percent_precision\": {},\n",
                 "  \"battery_style\": {},\n",
+                "  \"theme_index\": {},\n",
                 "  \"text_shadow\": {},\n",
                 "  \"bar_width\": {},\n",
                 "  \"bar_opacity\": {},\n",
@@ -411,6 +423,7 @@ impl Config {
             self.font_size,
             self.percent_precision,
             self.battery_style,
+            self.theme_index,
             self.text_shadow,
             self.bar_width,
             self.bar_opacity,

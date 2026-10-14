@@ -150,7 +150,8 @@ const PAGES: &[Page] = &[
                     Item::Toggle("show_battery_id", "Display the battery ID in the status popup", ""),
                     Item::Choice("font_size", "BatteryBar font", "条上文字字号"),
                     Item::Choice("percent_precision", "Percentage precision", "百分比小数位数"),
-                    Item::Choice("theme", "Theme", "电池外观主题"),
+                    Item::Choice("theme", "Theme", "电池外观主题，含外部 theme.xml 主题"),
+                    Item::Choice("theme_index", "External theme", "外部主题序号"),
                     Item::Toggle("text_shadow", "条上文字加 1px 阴影", "底色浅时更易读"),
                     Item::Choice("bar_opacity", "Bar background opacity", "条背景不透明度"),
                     Item::Choice("bar_width", "Horizontal bar width", "仅横排任务栏生效"),
@@ -265,6 +266,13 @@ const PAGES: &[Page] = &[
                     Item::Action("reset_profile", "清空曲线采样数据"),
                     Item::Toggle("log_battery_data", "Log battery data", "写入 BatteryStatus.log"),
                     Item::Toggle("show_rate_in_tooltip", "Show discharge rate in the status popup", "详情卡里显示实时功耗行"),
+                ],
+            },
+            Group {
+                title: "主题",
+                items: &[
+                    Item::Action("theme_folder", "打开主题文件夹…"),
+                    Item::Action("theme_reload", "重新扫描外部主题"),
                 ],
             },
             Group {
@@ -658,6 +666,20 @@ unsafe fn handle_click(hwnd: HWND, x: i32, y: i32) {
                         let _ = crate::hidden_command("explorer.exe").arg(p).spawn();
                     }
                 }
+                "theme_folder" => crate::theme::open_folder(),
+                "theme_reload" => {
+                    crate::theme::reload();
+                    let n = crate::theme::count();
+                    crate::tray_balloon(
+                        "BatteryBar Modern",
+                        if n == 0 {
+                            "没找到外部主题。把主题文件夹放进 themes 目录后重试。"
+                        } else {
+                            "已重新扫描外部主题。"
+                        },
+                    );
+                    need_repaint = true;
+                }
                 "crit_sound_pick" | "low_sound_pick" | "full_sound_pick" => {
                     let which = &id[..4].to_string();
                     if let Some(path) = pick_file("选择提示音文件", "音频文件\0*.wav;*.mp3\0所有文件\0*.*\0") {
@@ -754,7 +776,16 @@ unsafe fn handle_click(hwnd: HWND, x: i32, y: i32) {
                         need_relayout = true;
                     }
                     "percent_precision" => c.percent_precision = (c.percent_precision + 1) % 3,
-                    "theme" => c.battery_style = (c.battery_style + 1) % 2,
+                    "theme" => c.battery_style = (c.battery_style + 1) % 3,
+                    "theme_index" => {
+                        // 外部主题数量来自 themes 文件夹，随用户增删而变
+                        let n = crate::theme::count();
+                        if n > 0 {
+                            c.theme_index = ((c.theme_index as usize + 1) % n) as u32;
+                        } else {
+                            c.theme_index = 0;
+                        }
+                    }
                     "bar_opacity" => {
                         c.bar_opacity = match c.bar_opacity {
                             100 => 80,
@@ -1199,7 +1230,19 @@ fn choice_value(id: &str, c: &Config) -> String {
             _ => "大 17px".into(),
         },
         "percent_precision" => format!("{} 位小数", c.percent_precision),
-        "theme" => if c.battery_style == 0 { "经典拟物 Aero Glass".into() } else { "现代极简 Fluent".into() },
+        "theme" => match c.battery_style {
+            0 => "经典拟物 Aero Glass".into(),
+            1 => "现代极简 Fluent".into(),
+            _ => "外部主题 theme.xml".into(),
+        },
+        "theme_index" => {
+            if crate::theme::count() == 0 {
+                crate::theme::status_line()
+            } else {
+                crate::theme::name_of(c.theme_index as usize)
+                    .unwrap_or_else(|| format!("#{}", c.theme_index))
+            }
+        }
         "bar_opacity" => format!("{}%", c.bar_opacity),
         "bar_width" => format!("{} px", c.bar_width),
         "on_click_mode" => if c.on_click_mode == 0 { "轮播勾选项".into() } else { "直接弹详情卡".into() },
