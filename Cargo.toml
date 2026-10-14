@@ -1,6 +1,6 @@
 [package]
 name = "batterybar-modern"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 description = "Modern open-source BatteryBar: embedded taskbar battery bar + tray icon + detail popup (Windows 10/11)"
 license = "MIT"
@@ -30,6 +30,7 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Controls",
+    "Win32_UI_Controls_Dialogs",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
 ] }

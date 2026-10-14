@@ -13,6 +13,36 @@ use windows_core::{w, PCWSTR};
 pub const TRAY_CALLBACK: u32 = 0xB00B; // 自定义回调消息
 const TRAY_ID: u32 = 1;
 
+// ---- 自定义提示音 ----
+// windows-rs 0.62 没有导出 PlaySoundW，这里直接声明 winmm 的导入。
+// SND_ASYNC：立即返回，不阻塞调用线程（电池回调线程不能卡住）。
+const SND_ASYNC: u32 = 0x0001;
+const SND_NODEFAULT: u32 = 0x0002;
+const SND_FILENAME: u32 = 0x0002_0000;
+
+#[link(name = "winmm")]
+extern "system" {
+    fn PlaySoundW(pszsound: *const u16, hmod: isize, fdwsound: u32) -> i32;
+}
+
+/// 播放用户指定的自定义提示音（Notifications 页「Use custom sound」）。
+pub fn play_file(path: &str) {
+    let mut w: Vec<u16> = path.encode_utf16().collect();
+    w.push(0);
+    unsafe {
+        let _ = PlaySoundW(w.as_ptr(), 0, SND_FILENAME | SND_ASYNC | SND_NODEFAULT);
+    }
+}
+
+/// Notifications 页「Beep the system speaker」。
+/// 这是主板蜂鸣器的 Beep()，与 MessageBeep（播放系统声音方案里的 wav）不是一回事。
+pub fn beep() {
+    use windows::Win32::System::Diagnostics::Debug::Beep;
+    unsafe {
+        let _ = Beep(880, 180);
+    }
+}
+
 pub struct TrayIcon {
     pub hwnd: HWND,
 }

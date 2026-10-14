@@ -1,3 +1,4 @@
 /target
 build*.log
 errs_detail.txt
+ref/

@@ -1,10 +1,11 @@
 // batterybar-modern — 入口与主窗口（任务栏嵌入条）
 //
-// 窗口：
+// 窗口（对应原版 BatteryBar Pro 的各部件）：
 //   1. bar window      —— 任务栏内嵌条（SetParent 进 Shell_TrayWnd）
 //   2. message window  —— 托盘图标宿主（不可见）
-//   3. popup window    —— Status Popup（原版 8 行字段复刻）
-//   4. prefs window    —— Preferences（原版 Preferences 复刻）
+//   3. popup window    —— Status Popup（原版 7 字段复刻）
+//   4. prefs window    —— Preferences（原版 6 分类页复刻）
+//   5. graph window    —— Battery Profile Graph（原版 Pro 的独立曲线窗口）
 //
 // 子系统：Release 必须显式声明 windows 子系统。
 // windows-gnu 目标默认按 console 子系统链接，不声明的话启动 exe 会附带一个
@@ -13,10 +14,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![allow(non_snake_case)]
 
+mod clock;
 mod config;
+mod graph;
 mod popup;
 mod power;
 mod prefs;
+mod profile;
 mod render;
 mod taskbar;
 mod tray;
@@ -83,6 +87,10 @@ const ID_MENU_SCHEME_PERF: usize = 0x1022;
 const ID_MENU_PREFS: usize = 0x1013;
 const ID_MENU_TOGGLE: usize = 0x1014;
 const ID_MENU_EXIT: usize = 0x1015;
+/// Battery Profile Graph（原版 Pro 的独立曲线窗口）
+const ID_MENU_GRAPH: usize = 0x1030;
+/// Tools 页：清空曲线采样数据
+const ID_MENU_RESET_PROFILE: usize = 0x1031;
 
 // ---- 全局状态 ----
 static BAR_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
@@ -113,6 +121,16 @@ pub fn font_px_of(font_size: u32) -> i32 {
     13 + (font_size as i32) * 2
 }
 
+/// Warning Levels 页的两个阈值（低电量 %、临界电量 %）。
+///
+/// 曲线窗口画参考线、通知判定都从这里取，保证 UI 与行为同源。
+pub fn thresholds() -> (i32, i32) {
+    match config_lock().lock() {
+        Ok(c) => (c.low_percent, c.critical_percent),
+        Err(_) => (20, 10),
+    }
+}
+
 /// 竖排任务栏下条高度：图标盒 + 间隙 + 文字行，随字号伸缩。
 ///
 /// 高度必须跟着字号走。写死 46px 时，中号字（15px）的文字行要吃 19px，
@@ -129,6 +147,7 @@ pub fn set_mode(m: DisplayMode) {
         DisplayMode::DischargeRate => 2,
         DisplayMode::Capacity => 3,
         DisplayMode::Icon => 4,
+        DisplayMode::TimeFinished => 5,
     }, Ordering::Relaxed);
 }
 
@@ -138,8 +157,14 @@ fn mode_now() -> DisplayMode {
         2 => DisplayMode::DischargeRate,
         3 => DisplayMode::Capacity,
         4 => DisplayMode::Icon,
+        5 => DisplayMode::TimeFinished,
         _ => DisplayMode::TimeRemaining,
     }
+}
+
+/// `mode_now` 的公开版本（prefs.rs 勾选 display_items 时需要判断当前模式是否还在勾选列表里）。
+pub fn mode_now_pub() -> DisplayMode {
+    mode_now()
 }
 
 /// 拿当前托盘图标句柄发一条气泡提示。
@@ -186,9 +211,11 @@ fn on_ac_power() -> bool {
 /// 起因：任务栏条是 Shell_TrayWnd 的子窗口，拿不到键盘焦点；而 WM_MOUSEWHEEL
 /// 只投递给**焦点窗口**而非鼠标所在窗口，导致设置面板滚轮完全无效。
 fn maybe_forward_wheel(wparam: WPARAM) {
+    let delta = ((wparam.0 >> 16) as i16) as i32;
     if prefs::cursor_over_prefs() {
-        let delta = ((wparam.0 >> 16) as i16) as i32;
         prefs::forward_wheel(delta);
+    } else if graph::cursor_over_graph() {
+        graph::forward_wheel(delta);
     }
 }
 
@@ -237,6 +264,21 @@ fn main() -> windows_core::Result<()> {
     };
     unsafe {
         if RegisterClassW(&wc3) == 0 {
+            return Err(windows_core::Error::from_thread());
+        }
+    }
+
+    // 注册 Battery Profile Graph 曲线窗口类（BBM_Graph）
+    let graph_class = w!("BBM_Graph");
+    let wc4 = WNDCLASSW {
+        style: CS_HREDRAW | CS_VREDRAW | WAM::CS_DBLCLKS,
+        lpfnWndProc: Some(graph::graph_wndproc),
+        hInstance: hinstance.into(),
+        lpszClassName: PCWSTR::from_raw(graph_class.as_ptr()),
+        ..Default::default()
+    };
+    unsafe {
+        if RegisterClassW(&wc4) == 0 {
             return Err(windows_core::Error::from_thread());
         }
     }
@@ -316,7 +358,7 @@ fn main() -> windows_core::Result<()> {
             let cfg = config_lock();
             let (mode, learn, startup) = {
                 let c = cfg.lock().unwrap();
-                (c.default_mode, c.learn_profiles, c.run_at_startup)
+                (c.default_mode, c.statistical_estimation, c.run_at_startup)
             };
             set_mode(mode);
             power::LEARN_ENABLED.store(learn, Ordering::Relaxed);
@@ -333,10 +375,22 @@ fn main() -> windows_core::Result<()> {
         let _ = SetTimer(Some(msg_hwnd), TRAY_TIMER, TRAY_POLL_MS, None);
         let _ = SetTimer(Some(msg_hwnd), TIMER_REEMBED, REEMBED_MS, None);
 
-        // 7) 支持命令行直接打开设置面板
+        // 7) 支持命令行直接打开设置面板 / 曲线窗口
+        //    batterybar-modern.exe --prefs            打开 Preferencges
+        //    batterybar-modern.exe --prefs=tools      打开并直接跳到 Tools 分类页
+        //    batterybar-modern.exe --graph            打开电池曲线窗口
         let args: Vec<String> = std::env::args().collect();
-        if args.iter().any(|a| a == "--prefs" || a == "-p") {
+        if let Some(page) = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--prefs=").or_else(|| a.strip_prefix("-p=")))
+        {
+            prefs::show_page(page);
             prefs::toggle_prefs();
+        } else if args.iter().any(|a| a == "--prefs" || a == "-p") {
+            prefs::toggle_prefs();
+        }
+        if args.iter().any(|a| a == "--graph" || a == "-g") {
+            graph::toggle_graph();
         }
 
         // 8) 消息循环
@@ -574,7 +628,17 @@ fn show_bar_menu(hwnd: HWND) {
             let _ = AppendMenuW(menu, mark(cur == DisplayMode::Icon), ID_MENU_MODE_ICON, w!("只显示小图标 (Icon Only)"));
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x800) /* MF_SEPARATOR */, 0, PCWSTR::null());
 
-            // 3. 原版常规选项
+            // 3. 原版 Pro：独立的电池曲线窗口 + 工具
+            let graph_label = if graph::is_open() {
+                w!("关闭电池曲线窗口 (Battery Profile Graph)")
+            } else {
+                w!("打开电池曲线窗口… (Battery Profile Graph)")
+            };
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_GRAPH, graph_label);
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_RESET_PROFILE, w!("清空曲线数据 (Reset Profile Data)"));
+            let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0x800) /* MF_SEPARATOR */, 0, PCWSTR::null());
+
+            // 4. 原版常规选项
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_PREFS, w!("Preferences..."));
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_TOGGLE, w!("显示/隐藏条"));
             let _ = AppendMenuW(menu, MENU_ITEM_FLAGS(0), ID_MENU_EXIT, w!("退出"));
@@ -606,6 +670,13 @@ fn handle_menu_cmd(hwnd: HWND, cmd: usize) {
         }
         ID_MENU_PREFS => {
             prefs::toggle_prefs();
+        }
+        ID_MENU_GRAPH => {
+            graph::toggle_graph();
+        }
+        ID_MENU_RESET_PROFILE => {
+            profile::clear();
+            tray_balloon("BatteryBar Modern", "已清空电池曲线采样数据。");
         }
         ID_MENU_SCHEME_BALANCED => {
             set_active_power_scheme("381b4222-f694-41f0-9685-ff5bb260df2e");
@@ -655,26 +726,29 @@ fn handle_menu_cmd(hwnd: HWND, cmd: usize) {
     }
 }
 
-/// 低电/临界/满电 通知（原版 Notifications + Warning Levels）
+/// 低电/临界/满电 通知（原版 Notifications 页 + Warning Levels 页）
 ///
-/// 支持：低电 / 临界 / 满电气泡、临界电量自定义阈值（取 low 与 alarm 的更小者）、
-/// 系统提示音、临界电量自动动作（睡眠/关机/休眠/重启）、满电或接通电源时隐藏条。
+/// 原版 Notifications 页对三组事件（Critical / Low / Finished charging）各给
+/// 一组完全相同的控件：Audio alert、Show popup、Use custom sound、Beep the
+/// system speaker、Run a program。这里按同构处理，见 config::Notif。
+/// 另支持 Warning Levels 的自定义警报阈值（取 low 与 alarm 的更小者）与
+/// 临界电量自动动作（睡眠/关机/休眠/重启）。
 fn check_notifications(pct: i32, charging: bool) {
+    use crate::config::Notif;
     use std::sync::atomic::{AtomicBool, Ordering as O};
     let cfg = config_lock();
-    let (low, crit, n_low, n_crit, n_full, hide_full, alarm, crit_action, hide_on_ac, play_sound) = {
+    let (low, crit, n_low, n_crit, n_full, hide_full, alarm, crit_action, hide_on_ac) = {
         let c = cfg.lock().unwrap();
         (
             c.low_percent,
             c.critical_percent,
-            c.notify_low,
-            c.notify_critical,
-            c.notify_full,
+            c.notif_low.clone(),
+            c.notif_critical.clone(),
+            c.notif_full.clone(),
             c.hide_when_full,
             c.alarm_percent,
             c.critical_action,
             c.hide_on_ac,
-            c.play_sound,
         )
     };
 
@@ -682,7 +756,7 @@ fn check_notifications(pct: i32, charging: bool) {
     let low = if alarm > 0 { low.min(alarm) } else { low };
     let ac = on_ac_power();
 
-    // 自动隐藏：满电 且开启 hide_on_ac 则整条隐藏（接通电源就没有续航焦虑）
+    // 自动隐藏：满电 或 接通电源
     if hide_full || hide_on_ac {
         let bh = BAR_HWND.load(Ordering::Relaxed);
         if bh != 0 {
@@ -709,17 +783,6 @@ fn check_notifications(pct: i32, charging: bool) {
     }
     let t = tray::TrayIcon { hwnd: HWND(th as *mut _) };
 
-    // 满电：充+满 边沿触发
-    if n_full && pct >= 100 && charging {
-        if !FULL_LATCH.swap(true, O::Relaxed) {
-            t.balloon("BatteryBar Modern", "电池已充满，可以拔掉电源了。",
-                windows::Win32::UI::Shell::NIIF_INFO);
-            if play_sound { t.sound(); }
-        }
-    } else if pct < 100 {
-        FULL_LATCH.store(false, O::Relaxed);
-    }
-
     // 临界动作文案：按用户选择的动作预告下一步
     let crit_hint = match crit_action {
         1 => "即将自动进入睡眠",
@@ -729,24 +792,54 @@ fn check_notifications(pct: i32, charging: bool) {
         _ => "请立即接通电源",
     };
 
+    // 逐组投递：气泡 + 声音 + 外部程序，全部按 Notif 的勾选走。
+    let fire = |n: &Notif, title: &str, body: &str, level: windows::Win32::UI::Shell::NOTIFY_ICON_INFOTIP_FLAGS| {
+        if n.popup {
+            t.balloon(title, body, level);
+        }
+        if n.audio {
+            if n.custom_sound && !n.sound_path.is_empty() {
+                tray::play_file(&n.sound_path);
+            } else {
+                t.sound();
+            }
+        }
+        if n.beep {
+            tray::beep();
+        }
+        if n.run_program && !n.program_path.is_empty() {
+            let _ = hidden_command("cmd.exe")
+                .args(["/C", n.program_path.as_str()])
+                .spawn();
+        }
+    };
+
+    // 满电：充+满 边沿触发
+    if pct >= 100 && charging {
+        if !FULL_LATCH.swap(true, O::Relaxed) {
+            fire(&n_full, "BatteryBar Modern", "电池已充满，可以拔掉电源了。",
+                windows::Win32::UI::Shell::NIIF_INFO);
+        }
+    } else if pct < 100 {
+        FULL_LATCH.store(false, O::Relaxed);
+    }
+
     // 临界：放+≤crit 边沿
-    if n_crit && !charging && pct <= crit {
+    if !charging && pct <= crit {
         if !CRIT_LATCH.swap(true, O::Relaxed) {
-            t.balloon("电量临界",
+            fire(&n_crit, "电量临界",
                 &format!("电池仅剩 {}%，{}！", pct, crit_hint),
                 windows::Win32::UI::Shell::NIIF_WARNING);
-            if play_sound { t.sound(); }
         }
     } else if charging || pct > crit {
         CRIT_LATCH.store(false, O::Relaxed);
     }
 
     // 低电：放+≤low 边沿
-    if n_low && !charging && pct <= low {
+    if !charging && pct <= low {
         if !LOW_LATCH.swap(true, O::Relaxed) {
-            t.balloon("电量不足", &format!("电池仅剩 {}%，建议接通电源。", pct),
+            fire(&n_low, "电量不足", &format!("电池仅剩 {}%，建议接通电源。", pct),
                 windows::Win32::UI::Shell::NIIF_WARNING);
-            if play_sound { t.sound(); }
         }
     } else if charging || pct > low {
         LOW_LATCH.store(false, O::Relaxed);
@@ -762,7 +855,7 @@ fn check_notifications(pct: i32, charging: bool) {
         ALARM_LATCH.store(false, O::Relaxed);
     }
 
-    // 临界电量自动动作（边沿触发，一次只做一次；执行前把 latch 置位防抖动重复触发）
+    // 临界电量自动动作（边沿触发，只执行一次）
     if crit_action > 0 && !charging && pct <= crit {
         if !ACT_LATCH.swap(true, O::Relaxed) {
             run_critical_action(crit_action);
@@ -817,54 +910,22 @@ unsafe extern "system" fn msg_wndproc(
             }
             LRESULT(0)
         }
-        WAM::WM_COMMAND => match (wparam.0 & 0xFFFF) as usize {
-            ID_MENU_EXIT => {
-                let _ = PostQuitMessage(0);
-                LRESULT(0)
+        WAM::WM_COMMAND => {
+            // 统一走与右键菜单相同的命令分发，避免两处命令表各写一份而漂移
+            // ——此前这里只列了 4 个命令，导致「电池曲线」「清空曲线数据」
+            // 「电源计划」「实时功率/剩余容量」这些通过 WM_COMMAND 发进来的
+            // 命令全部落进 _ => LRESULT(0)，点了没反应。
+            //
+            // 必须传条窗口而不是 MsgHost：handle_menu_cmd 的「显示/隐藏条」
+            // 分支按传入窗口自身的可见性取反，传 MsgHost 会去隐藏一个本来就
+            // 不可见的窗口。
+            let cmd = (wparam.0 & 0xFFFF) as usize;
+            let bh = BAR_HWND.load(Ordering::Relaxed);
+            if bh != 0 {
+                handle_menu_cmd(HWND(bh as *mut _), cmd);
             }
-            ID_MENU_PREFS => {
-                prefs::toggle_prefs();
-                LRESULT(0)
-            }
-            ID_MENU_MODE_TIME => {
-                set_mode(DisplayMode::TimeRemaining);
-                save_mode();
-                let bh = BAR_HWND.load(Ordering::Relaxed);
-                if bh != 0 {
-                    let _ = InvalidateRect(Some(HWND(bh as *mut _)), None, false);
-                }
-                LRESULT(0)
-            }
-            ID_MENU_MODE_PCT => {
-                set_mode(DisplayMode::Percent);
-                save_mode();
-                let bh = BAR_HWND.load(Ordering::Relaxed);
-                if bh != 0 {
-                    let _ = InvalidateRect(Some(HWND(bh as *mut _)), None, false);
-                }
-                LRESULT(0)
-            }
-            ID_MENU_MODE_ICON => {
-                set_mode(DisplayMode::Icon);
-                save_mode();
-                let bh = BAR_HWND.load(Ordering::Relaxed);
-                if bh != 0 {
-                    let _ = InvalidateRect(Some(HWND(bh as *mut _)), None, false);
-                }
-                LRESULT(0)
-            }
-            ID_MENU_TOGGLE => {
-                let bh = BAR_HWND.load(Ordering::Relaxed);
-                if bh != 0 {
-                    let bar = HWND(bh as *mut _);
-                    let vis = IsWindowVisible(bar).as_bool();
-                    let cmd = if vis { SW_HIDE } else { SW_SHOW };
-                    let _ = ShowWindow(bar, cmd);
-                }
-                LRESULT(0)
-            }
-            _ => LRESULT(0),
-        },
+            LRESULT(0)
+        }
         WAM::WM_TIMER if wparam.0 == TRAY_TIMER => {
             // 兜底轮询电池状态（WinRT 事件可能丢）
             power::poll_once();
@@ -950,8 +1011,13 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
     let c = cfg.lock().unwrap();
 
     // 任务栏底色铺底（支持不透明度：<100 时 AlphaBlend 让任务栏自身 Acrylic 透上来）
-    let (tr, tg, tb) = if dark { c.dark_taskbar_tint } else { c.light_taskbar_tint };
-    let bg = render::rgb(tr, tg, tb);
+    // Windows 11 任务栏底色：深色 #202020、浅色 #F3F3F3。这两个值跟着系统主题走，
+    // 不由用户配置 —— 用别的色会与相邻的任务栏按钮明显割裂。
+    let bg = if dark {
+        render::rgb(0x20, 0x20, 0x20)
+    } else {
+        render::rgb(0xF3, 0xF3, 0xF3)
+    };
     if !render::fill_solid_alpha(hdc, rc, bg, c.bar_opacity) {
         render::fill_solid(hdc, rc, bg);
     }
@@ -1009,7 +1075,21 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
             }
             DisplayMode::Percent => {
                 // 充电标识由电池图标上的闪电承担，文字不再重复加 ⚡（小字号会糊成一团）
-                format!("{}%", pct)
+                // Percentage precision（Display 页）决定小数位：0/1/2。
+                match c.percent_precision {
+                    0 => format!("{}%", pct),
+                    2 => format!("{:.2}%", pct as f64),
+                    _ => format!("{:.1}%", pct as f64),
+                }
+            }
+            DisplayMode::TimeFinished => {
+                // 原版 3.6.4：显示充满/放空的当日时刻，如 `@ 5:23 PM`
+                let fin = power::FINISH_AT.load(Ordering::Relaxed);
+                if fin > 0 {
+                    format!("@ {}", clock::hm12(fin as i64))
+                } else {
+                    "—".to_string()
+                }
             }
             DisplayMode::DischargeRate => {
                 let mw = power::CHARGE_RATE_MW.load(Ordering::Relaxed);
@@ -1022,7 +1102,7 @@ unsafe fn paint_bar(hdc: windows::Win32::Graphics::Gdi::HDC, rc: &RECT) {
                 }
             }
             DisplayMode::Capacity => {
-                let rem = power::REMAIN_MWH.load(Ordering::Relaxed);
+                let rem = power::remaining_mwh(pct);
                 if rem > 0 {
                     format!("{:.1}Wh", (rem as f64) / 1000.0)
                 } else {

@@ -20,12 +20,35 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows_core::{w, PCWSTR};
 
+use crate::clock;
 use crate::power;
 use crate::render;
 
-const POPUP_W: i32 = 330;
-const POPUP_H: i32 = 360;
+const POPUP_W: i32 = 360;
+const ROW_H: i32 = 26;
 const TIMER_ID: usize = 42;
+
+/// 原版 BatteryBar Pro 的状态弹窗是一张固定字段表；我们保留同样的字段集合
+/// （见 docs/RESEARCH-original-batterybar.md 的 Status Popup 一节），
+/// 但用 Telegram 级排版呈现。
+///
+/// 可开关的行由 Preferences 决定，因此窗口高度必须按当前配置算出来 ——
+/// 窗口尺寸在 CreateWindowExW 时就定死了，创建后再改行会露白。
+fn popup_row_count() -> i32 {
+    let c = crate::config_lock().lock().unwrap();
+    let mut n = 6; // 电量 / 容量 / 剩余时间 / 已用时间 / 满电可用 / 电池损耗
+    if c.show_rate_in_tooltip {
+        n += 1; // 充电速率
+    }
+    if c.show_battery_id {
+        n += 1; // 电池 ID
+    }
+    n + 1 // 电源计划
+}
+
+pub fn popup_height() -> i32 {
+    130 + popup_row_count() * ROW_H + 8 + 12
+}
 
 struct Popup {
     palette: render::Palette,
@@ -76,14 +99,15 @@ pub fn toggle_popup() {
         let mut pt = windows::Win32::Foundation::POINT::default();
         let _ = GetCursorPos(&mut pt);
         let (sw, sh) = render::screen_size();
+        let popup_h = popup_height();
         let mut x = pt.x + 12;
-        let mut y = pt.y - POPUP_H - 8;
+        let mut y = pt.y - popup_h - 8;
         if x + POPUP_W > sw - 4 {
             x = pt.x - POPUP_W - 12;
         }
         x = x.clamp(4, sw - POPUP_W - 4);
         y = y.max(4);
-        if y > sh - POPUP_H - 40 {
+        if y > sh - popup_h - 40 {
             y = pt.y + 24;
         }
 
@@ -104,7 +128,7 @@ pub fn toggle_popup() {
             x,
             y,
             POPUP_W,
-            POPUP_H,
+            popup_h,
             None,
             None,
             Some(hinstance.into()),
@@ -202,17 +226,16 @@ fn get_active_power_scheme() -> String {
 
 unsafe fn paint_popup(p: &Popup, hdc: HDC) {
     let pal = &p.palette;
-    let rc = RECT { left: 0, top: 0, right: POPUP_W, bottom: POPUP_H };
+    let popup_h = popup_height();
+    let rc = RECT { left: 0, top: 0, right: POPUP_W, bottom: popup_h };
     FillRect(hdc, &rc, CreateSolidBrush(pal.bg));
-    render::stroke_round(hdc, 0, 0, POPUP_W, POPUP_H, 10, pal.border);
+    render::stroke_round(hdc, 0, 0, POPUP_W, popup_h, 10, pal.border);
     render::set_bk_transparent(hdc);
 
     let pct = power::PERCENT.load(Ordering::Relaxed);
     let charging = power::CHARGING.load(Ordering::Relaxed);
     let eta = power::ETA_SECONDS.load(Ordering::Relaxed);
-    let full_life = power::FULL_LIFETIME_SECONDS.load(Ordering::Relaxed);
     let rate = power::CHARGE_RATE_MW.load(Ordering::Relaxed);
-    let rem = power::REMAIN_MWH.load(Ordering::Relaxed);
     let full = power::FULL_MWH.load(Ordering::Relaxed);
     let health = power::health_percent();
 
@@ -272,11 +295,11 @@ unsafe fn paint_popup(p: &Popup, hdc: HDC) {
     let mut strc = RECT { left: hero_l, top: hero_t + 58, right: hero_r, bottom: hero_b - 4 };
     DrawTextW(hdc, &mut stbuf, &mut strc, DT_NOPREFIX | DT_SINGLELINE | windows::Win32::Graphics::Gdi::DT_CENTER | windows::Win32::Graphics::Gdi::DT_VCENTER);
 
-    // 3. 分组列表（Grouped Cells）
+    // 3. 分组列表 · Grouped Cells
     let draw_cell_group = |start_y: i32, rows: &[(&str, String, Option<windows::Win32::Foundation::COLORREF>)]| -> i32 {
         let group_l = 16;
         let group_r = POPUP_W - 16;
-        let row_h = 28;
+        let row_h = ROW_H;
         let group_h = rows.len() as i32 * row_h + 8;
         render::fill_round(hdc, group_l, start_y, group_r, start_y + group_h, 8, pal.surface);
         render::stroke_round(hdc, group_l, start_y, group_r, start_y + group_h, 8, pal.border);
@@ -300,26 +323,133 @@ unsafe fn paint_popup(p: &Popup, hdc: HDC) {
         start_y + group_h + 10
     };
 
-    // 「实时功耗」行受 Preferences → BATTERY TOOLS 的 show_rate_in_tooltip 控制
-    let show_rate = crate::config_lock().lock().unwrap().show_rate_in_tooltip;
+    // 一次读完配置并取出标量：Mutex 不可重入，后面不能再锁。
+    let (prec, soft_min, full_level, show_rate, show_batt_id) = {
+        let c = crate::config_lock().lock().unwrap();
+        (
+            c.percent_precision.min(3) as usize,
+            c.soft_min_percent,
+            c.full_percent,
+            c.show_rate_in_tooltip,
+            c.show_battery_id,
+        )
+    };
 
-    let mut group1_rows: Vec<(&str, String, Option<windows::Win32::Foundation::COLORREF>)> = vec![
-        ("电量容量", if full > 0 { format!("{:.1} / {:.1} Wh", rem as f64 / 1000.0, full as f64 / 1000.0) } else { "—".into() }, None),
-    ];
+    let design = power::DESIGN_MWH.load(Ordering::Relaxed);
+    let elapsed = power::ELAPSED_SECONDS.load(Ordering::Relaxed);
+    let start_pct = power::SESSION_START_PCT.load(Ordering::Relaxed);
+    let finish_at = power::FINISH_AT.load(Ordering::Relaxed);
+    let session_charging = power::SESSION_CHARGING.load(Ordering::Relaxed);
+    let runtime = power::full_runtime_seconds(soft_min, full_level);
+
+    // 字段顺序与文案对齐原版 BatteryBar Pro 的状态弹窗：
+    //   Percent / Capacity / Charge Rate / Time Remaining / Elapsed Time /
+    //   Full Runtime / Battery Wear —— 见 docs/RESEARCH-original-batterybar.md。
+    let mut rows: Vec<(&str, String, Option<windows::Win32::Foundation::COLORREF>)> = Vec::new();
+
+    rows.push((
+        "电量百分比",
+        if pct < 0 { "—".to_string() } else { format!("{:.*}%", prec, pct as f64) },
+        None,
+    ));
+
+    rows.push((
+        "当前容量",
+        if full > 0 {
+            // 走 power::remaining_mwh 的脏值兜底，避免出现「100% 却只剩 1.9Wh」。
+            let rem_show = power::remaining_mwh(pct);
+            format!("{} mWh / {} mWh", group_thousands(rem_show), group_thousands(full))
+        } else {
+            "—".to_string()
+        },
+        None,
+    ));
+
     if show_rate {
-        group1_rows.push((
-            "实时功耗",
-            if rate == 0 { "0 mW".into() } else { format!("{} mW", rate) },
+        rows.push((
+            "充电/放电速率",
+            if rate == 0 { "0 mW".to_string() } else { format!("{} mW", group_thousands(rate as i64)) },
             Some(if rate < 0 { pal.accent_blue } else { pal.text }),
         ));
     }
-    group1_rows.push(("满电可用时长", fmt_hms(full_life), None));
-    let next_y = draw_cell_group(130, &group1_rows);
 
-    let group2 = [
-        ("电池损耗率", if health > 0 { format!("{}% (健康度 {}%)", 100 - health, health) } else { "—".into() }, Some(if health < 80 { pal.accent_warn } else { pal.accent_green })),
-        ("供电模式", if charging { "A/C 交流电已接通".into() } else { "便携电池供电".into() }, None),
-        ("电源计划", get_active_power_scheme(), Some(pal.accent_blue)),
-    ];
-    draw_cell_group(next_y, &group2);
+    // 原版写法：1:18 @ 5:05 PM · Charging
+    let remain_text = if eta > 0 {
+        let mut s = clock::duration(eta);
+        if finish_at > 0 {
+            s.push_str(&format!(" @ {}", clock::hm12(finish_at as i64)));
+        }
+        s.push_str(if session_charging { " · 充电中" } else { " · 放电中" });
+        s
+    } else if charging && pct >= 100 {
+        "已充满 · 接通电源".to_string()
+    } else {
+        "—".to_string()
+    };
+    rows.push(("剩余时间", remain_text, None));
+
+    // 原版写法：0:07 · since 70.4%
+    let mut elapsed_text = clock::duration(elapsed);
+    if start_pct > 0 {
+        elapsed_text.push_str(&format!(" · 自 {}%", start_pct));
+    }
+    rows.push(("已用时间", elapsed_text, None));
+
+    rows.push((
+        "满电可用时长",
+        if runtime > 0 { clock::duration(runtime) } else { "—".to_string() },
+        None,
+    ));
+
+    // 原版写法：0.0% of 42,454 mWh
+    rows.push((
+        "电池损耗",
+        if health > 0 && design > 0 {
+            format!("{}% of {} mWh", (100 - health).max(0), group_thousands(design))
+        } else if health > 0 {
+            format!("{}%", (100 - health).max(0))
+        } else {
+            "—".to_string()
+        },
+        Some(if health > 0 && health < 80 { pal.accent_warn } else { pal.accent_green }),
+    ));
+
+    if show_batt_id {
+        rows.push(("电池 ID", battery_id(), Some(pal.text_dim)));
+    }
+
+    rows.push(("电源计划", get_active_power_scheme(), Some(pal.accent_blue)));
+
+    draw_cell_group(130, &rows);
+}
+
+/// 千分位分组 —— 原版把容量写成 30,780 mWh。
+fn group_thousands(n: i64) -> String {
+    let neg = n < 0;
+    let digits = n.abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if neg { format!("-{out}") } else { out }
+}
+
+/// 电池硬件标识。原版 Display 页可让它在状态弹窗里显示；
+/// 取不到时退回「设计容量 + 满充容量」构成的稳定伪 ID，同型号电池一致。
+fn battery_id() -> String {
+    if let Some(id) = power::BATTERY_ID.get() {
+        if !id.is_empty() {
+            return id.clone();
+        }
+    }
+    let design = power::DESIGN_MWH.load(Ordering::Relaxed);
+    let full = power::FULL_MWH.load(Ordering::Relaxed);
+    if design > 0 {
+        format!("{} mWh 设计容量 / {} mWh 满充", design, full)
+    } else {
+        "未知".to_string()
+    }
 }
